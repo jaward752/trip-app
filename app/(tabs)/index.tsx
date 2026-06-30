@@ -253,6 +253,7 @@ export default function HomeScreen() {
 
   const [activeTrip, setActiveTrip] = useState<Trip | null>(null);
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+  const [viewerPhotos, setViewerPhotos] = useState<Photo[]>([]);
   const [activeStop, setActiveStop] = useState<Stop | null>(null);
 
   const [editingTripId, setEditingTripId] = useState<string | null>(null);
@@ -367,11 +368,11 @@ export default function HomeScreen() {
     setScreen("albums");
   }
 
-  function saveCaptionTo(index: number, text: string) {
+  function saveCaptionTo(photoId: string, text: string) {
     setActiveTrip((prev) => {
       if (!prev) return prev;
-      const updatedPhotos = prev.photos.map((p, i) =>
-        i === index ? { ...p, caption: text } : p
+      const updatedPhotos = prev.photos.map((p) =>
+        p.id === photoId ? { ...p, caption: text } : p
       );
       const updatedTrip = { ...prev, photos: updatedPhotos };
       setTrips((all) =>
@@ -381,14 +382,15 @@ export default function HomeScreen() {
     });
   }
 
-  function openViewer(index: number) {
-    if (!activeTrip) return;
+  function openViewer(photos: Photo[], index: number) {
+    setViewerPhotos(photos);
     setViewerIndex(index);
   }
 
   function closeViewer() {
     Keyboard.dismiss();
     setViewerIndex(null);
+    setViewerPhotos([]);
   }
 
   function onViewerScroll(e: any) {
@@ -436,6 +438,47 @@ export default function HomeScreen() {
   const mapTrips = trips.filter(
     (t) => t.destination === "map" || t.destination === "both"
   );
+
+  // ---------- FULL-SCREEN SWIPEABLE VIEWER ----------
+  if (viewerIndex !== null && viewerPhotos.length > 0) {
+    return (
+      <View style={styles.viewer}>
+        <View style={styles.viewerHeader}>
+          <Text style={styles.viewerAlbumName} numberOfLines={1}>
+            {activeTrip?.name ?? ""}
+          </Text>
+          <Text style={styles.viewerCount}>
+            {viewerIndex + 1} / {viewerPhotos.length}
+          </Text>
+        </View>
+
+        <TouchableOpacity style={styles.viewerClose} onPress={closeViewer}>
+          <Text style={styles.viewerCloseText}>✕</Text>
+        </TouchableOpacity>
+
+        <FlatList
+          data={viewerPhotos}
+          keyExtractor={(p) => p.id}
+          horizontal
+          pagingEnabled
+          showsHorizontalScrollIndicator={false}
+          initialScrollIndex={viewerIndex}
+          getItemLayout={(_, index) => ({
+            length: SCREEN_W,
+            offset: SCREEN_W * index,
+            index,
+          })}
+          onMomentumScrollEnd={onViewerScroll}
+          renderItem={({ item }) => (
+            <ViewerPage
+              photo={item}
+              onChangeCaption={(t) => saveCaptionTo(item.id, t)}
+            />
+          )}
+        />
+      </View>
+    );
+  }
 
   // ---------- GLOBAL MAP ----------
   if (screen === "globalmap") {
@@ -510,10 +553,14 @@ export default function HomeScreen() {
           keyExtractor={(p) => p.id}
           numColumns={3}
           contentContainerStyle={{ padding: 4, paddingBottom: 24 }}
-          renderItem={({ item }) => (
-            <View style={styles.pickCell}>
+          renderItem={({ item, index }) => (
+            <TouchableOpacity
+              style={styles.pickCell}
+              onPress={() => openViewer(activeStop!.photos, index)}
+              activeOpacity={0.85}
+            >
               <Image source={{ uri: item.uri }} style={styles.gridThumb} />
-            </View>
+            </TouchableOpacity>
           )}
         />
       </View>
@@ -576,47 +623,6 @@ export default function HomeScreen() {
             />
           ))}
         </MapView>
-      </View>
-    );
-  }
-
-  // ---------- FULL-SCREEN SWIPEABLE VIEWER ----------
-  if (screen === "album" && activeTrip && viewerIndex !== null) {
-    return (
-      <View style={styles.viewer}>
-        <View style={styles.viewerHeader}>
-          <Text style={styles.viewerAlbumName} numberOfLines={1}>
-            {activeTrip.name}
-          </Text>
-          <Text style={styles.viewerCount}>
-            {viewerIndex + 1} / {activeTrip.photos.length}
-          </Text>
-        </View>
-
-        <TouchableOpacity style={styles.viewerClose} onPress={closeViewer}>
-          <Text style={styles.viewerCloseText}>✕</Text>
-        </TouchableOpacity>
-
-        <FlatList
-          data={activeTrip.photos}
-          keyExtractor={(p) => p.id}
-          horizontal
-          pagingEnabled
-          showsHorizontalScrollIndicator={false}
-          initialScrollIndex={viewerIndex}
-          getItemLayout={(_, index) => ({
-            length: SCREEN_W,
-            offset: SCREEN_W * index,
-            index,
-          })}
-          onMomentumScrollEnd={onViewerScroll}
-          renderItem={({ item, index }) => (
-            <ViewerPage
-              photo={item}
-              onChangeCaption={(t) => saveCaptionTo(index, t)}
-            />
-          )}
-        />
       </View>
     );
   }
@@ -687,7 +693,7 @@ export default function HomeScreen() {
           renderItem={({ item, index }) => (
             <TouchableOpacity
               style={styles.pickCell}
-              onPress={() => openViewer(index)}
+              onPress={() => openViewer(activeTrip!.photos, index)}
               activeOpacity={0.85}
             >
               <Image source={{ uri: item.uri }} style={styles.gridThumb} />
