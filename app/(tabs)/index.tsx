@@ -3,6 +3,7 @@ import * as MediaLibrary from "expo-media-library";
 import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   Dimensions,
   FlatList,
   Image,
@@ -252,6 +253,9 @@ export default function HomeScreen() {
   const [activeTrip, setActiveTrip] = useState<Trip | null>(null);
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
 
+  const [editingTripId, setEditingTripId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+
   // Load saved trips once, on first mount.
   useEffect(() => {
     (async () => {
@@ -391,6 +395,37 @@ export default function HomeScreen() {
       Keyboard.dismiss();
       setViewerIndex(newIndex);
     }
+  }
+
+  function deleteTrip(id: string) {
+    Alert.alert("Delete trip", "This can't be undone.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: () => setTrips((prev) => prev.filter((t) => t.id !== id)),
+      },
+    ]);
+  }
+
+  function startEdit(trip: Trip) {
+    setEditingTripId(trip.id);
+    setEditingName(trip.name);
+  }
+
+  function confirmEdit() {
+    if (!editingTripId) return;
+    const trimmed = editingName.trim();
+    if (trimmed) {
+      setTrips((prev) =>
+        prev.map((t) => (t.id === editingTripId ? { ...t, name: trimmed } : t))
+      );
+      if (activeTrip?.id === editingTripId) {
+        setActiveTrip((prev) => (prev ? { ...prev, name: trimmed } : prev));
+      }
+    }
+    setEditingTripId(null);
+    setEditingName("");
   }
 
   const albumTrips = trips.filter(
@@ -767,30 +802,63 @@ export default function HomeScreen() {
             data={albumTrips}
             keyExtractor={(t) => t.id}
             contentContainerStyle={{ padding: 12, paddingBottom: 90 }}
-            renderItem={({ item }) => (
-              <TouchableOpacity
-                style={styles.tripCard}
-                onPress={() => {
-                  setActiveTrip(item);
-                  setScreen("album");
-                }}
-              >
-                {item.photos[0] && (
-                  <Image
-                    source={{ uri: item.photos[0].uri }}
-                    style={styles.tripCover}
-                  />
-                )}
-                <View style={styles.tripMeta}>
-                  <Text style={styles.tripTitle}>{item.name}</Text>
-                  <Text style={styles.tripSub}>
-                    {item.photos.length} photo
-                    {item.photos.length === 1 ? "" : "s"}
-                    {item.destination === "both" ? "  ·  on map too" : ""}
-                  </Text>
-                </View>
-              </TouchableOpacity>
-            )}
+            renderItem={({ item }) => {
+              const isEditing = editingTripId === item.id;
+              return (
+                <TouchableOpacity
+                  style={styles.tripCard}
+                  activeOpacity={0.85}
+                  onPress={() => {
+                    if (isEditing) return;
+                    setActiveTrip(item);
+                    setScreen("album");
+                  }}
+                >
+                  {item.photos[0] && (
+                    <Image
+                      source={{ uri: item.photos[0].uri }}
+                      style={styles.tripCover}
+                    />
+                  )}
+                  <View style={styles.tripMeta}>
+                    {isEditing ? (
+                      <TextInput
+                        style={styles.tripTitleInput}
+                        value={editingName}
+                        onChangeText={setEditingName}
+                        autoFocus
+                        returnKeyType="done"
+                        onSubmitEditing={confirmEdit}
+                        onBlur={confirmEdit}
+                      />
+                    ) : (
+                      <Text style={styles.tripTitle}>{item.name}</Text>
+                    )}
+                    <Text style={styles.tripSub}>
+                      {item.photos.length} photo
+                      {item.photos.length === 1 ? "" : "s"}
+                      {item.destination === "both" ? "  ·  on map too" : ""}
+                    </Text>
+                  </View>
+                  <View style={styles.tripActions}>
+                    {isEditing ? (
+                      <TouchableOpacity style={styles.actionBtn} onPress={confirmEdit}>
+                        <Text style={styles.actionConfirm}>✓</Text>
+                      </TouchableOpacity>
+                    ) : (
+                      <>
+                        <TouchableOpacity style={styles.actionBtn} onPress={() => startEdit(item)}>
+                          <Text style={styles.actionIcon}>✏️</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.actionBtn} onPress={() => deleteTrip(item.id)}>
+                          <Text style={styles.actionIcon}>🗑️</Text>
+                        </TouchableOpacity>
+                      </>
+                    )}
+                  </View>
+                </TouchableOpacity>
+              );
+            }}
           />
         )}
         <TouchableOpacity style={styles.floatingBtn} onPress={openPicker}>
@@ -968,7 +1036,25 @@ const styles = StyleSheet.create({
   tripCover: { width: 80, height: 80, borderRadius: 10, backgroundColor: "#eee" },
   tripMeta: { marginLeft: 14, flex: 1 },
   tripTitle: { fontSize: 16, fontWeight: "700", color: "#2b2b2b" },
+  tripTitleInput: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#2b2b2b",
+    borderBottomWidth: 1.5,
+    borderBottomColor: "#8b3a2f",
+    padding: 0,
+    margin: 0,
+  },
   tripSub: { fontSize: 13, color: "#9a8c7a", marginTop: 4 },
+  tripActions: { flexDirection: "column", alignItems: "center", marginLeft: 6 },
+  actionBtn: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  actionIcon: { fontSize: 18 },
+  actionConfirm: { fontSize: 22, color: "#8b3a2f", fontWeight: "700" },
 
   stopCard: {
     flexDirection: "row",
