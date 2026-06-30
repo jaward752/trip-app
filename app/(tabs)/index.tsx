@@ -1,6 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as MediaLibrary from "expo-media-library";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -28,7 +28,7 @@ type Photo = {
   lat: number | null;
   lon: number | null;
   caption: string;
-  asset?: MediaLibrary.Asset; // optional: only present for freshly-picked photos
+  asset?: MediaLibrary.Asset;
 };
 
 type Destination = "album" | "map" | "both";
@@ -59,7 +59,6 @@ function toNum(v: unknown): number | null {
 
 // ---------- PERSISTENCE ----------
 
-// Turn trips into a lightweight JSON-safe form (no image uri, no asset, dates as numbers).
 function serializeTrips(trips: Trip[]): string {
   const plain = trips.map((t) => ({
     id: t.id,
@@ -84,7 +83,6 @@ async function saveTripsToStorage(trips: Trip[]) {
   }
 }
 
-// Load trips and re-fetch each photo's current image uri from the library by ID.
 async function loadTripsFromStorage(): Promise<Trip[]> {
   try {
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
@@ -100,9 +98,9 @@ async function loadTripsFromStorage(): Promise<Trip[]> {
           const info = await MediaLibrary.getAssetInfoAsync(p.id);
           uri = info.localUri ?? info.uri ?? "";
         } catch {
-          uri = ""; // photo may have been deleted from the library
+          uri = "";
         }
-        if (!uri) continue; // skip photos that no longer exist
+        if (!uri) continue;
         photos.push({
           id: p.id,
           uri,
@@ -190,6 +188,27 @@ function tripCentre(trip: Trip): { lat: number; lon: number } | null {
   };
 }
 
+function boundsForCoords(
+  coords: { lat: number; lon: number }[],
+  padding = 0.25,
+  minDelta = 0
+): { latitude: number; longitude: number; latitudeDelta: number; longitudeDelta: number } {
+  const lats = coords.map((c) => c.lat);
+  const lons = coords.map((c) => c.lon);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  const latDelta = Math.max(maxLat - minLat, 0.02, minDelta) * (1 + padding);
+  const lonDelta = Math.max(maxLon - minLon, 0.02, minDelta) * (1 + padding);
+  return {
+    latitude: (minLat + maxLat) / 2,
+    longitude: (minLon + maxLon) / 2,
+    latitudeDelta: latDelta,
+    longitudeDelta: lonDelta,
+  };
+}
+
 type Screen =
   | "home"
   | "albums"
@@ -221,7 +240,7 @@ function ViewerPage({
       <View style={styles.captionZone}>
         <TextInput
           style={styles.captionInput}
-          placeholder="Add a caption…"
+          placeholder="Add a caption..."
           placeholderTextColor="rgba(255,255,255,0.4)"
           value={text}
           onChangeText={(t) => {
@@ -251,15 +270,18 @@ export default function HomeScreen() {
   const [tripName, setTripName] = useState("");
   const [destination, setDestination] = useState<Destination>("album");
 
+  const mapRef = useRef<MapView>(null);
+
   const [activeTrip, setActiveTrip] = useState<Trip | null>(null);
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
   const [viewerPhotos, setViewerPhotos] = useState<Photo[]>([]);
   const [activeStop, setActiveStop] = useState<Stop | null>(null);
+  const [selectedTrip, setSelectedTrip] = useState<Trip | null>(null);
+  const [stopgridReturn, setStopgridReturn] = useState<Screen>("tripmap");
 
   const [editingTripId, setEditingTripId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
-  // Load saved trips once, on first mount.
   useEffect(() => {
     (async () => {
       const saved = await loadTripsFromStorage();
@@ -268,8 +290,6 @@ export default function HomeScreen() {
     })();
   }, []);
 
-  // Save whenever trips change — but only after the initial load, so we don't
-  // overwrite storage with an empty list before loading finishes.
   useEffect(() => {
     if (loadedFromStorage) {
       saveTripsToStorage(trips);
@@ -453,7 +473,7 @@ export default function HomeScreen() {
         </View>
 
         <TouchableOpacity style={styles.viewerClose} onPress={closeViewer}>
-          <Text style={styles.viewerCloseText}>✕</Text>
+          <Text style={styles.viewerCloseText}>{"✕"}</Text>
         </TouchableOpacity>
 
         <FlatList
@@ -489,6 +509,9 @@ export default function HomeScreen() {
       centre: { lat: number; lon: number };
     }[];
 
+    const selectedStops = selectedTrip ? clusterIntoStops(selectedTrip.photos) : [];
+    const worldRegion = boundsForCoords(pinned.map((p) => p.centre), 0.3, 20);
+
     return (
       <View style={styles.screen}>
         <Header
@@ -499,37 +522,92 @@ export default function HomeScreen() {
         {pinned.length === 0 ? (
           <View style={styles.center}>
             <Text style={styles.muted}>
-              No map trips yet. Create a trip and choose “Map” or “Both”.
+              No map trips yet. Create a trip and choose Map or Both.
             </Text>
           </View>
         ) : (
-          <MapView
-            style={{ flex: 1 }}
-            initialRegion={{
-              latitude: pinned[0].centre.lat,
-              longitude: pinned[0].centre.lon,
-              latitudeDelta: 60,
-              longitudeDelta: 60,
-            }}
-          >
-            {pinned.map(({ trip, centre }) => (
-              <Marker
-                key={trip.id}
-                coordinate={{ latitude: centre.lat, longitude: centre.lon }}
+          <>
+            <MapView
+              ref={mapRef}
+              style={{ flex: 1 }}
+              initialRegion={
+                selectedTrip && selectedStops.length > 0
+                  ? boundsForCoords(selectedStops.map((s) => ({ lat: s.lat, lon: s.lon })))
+                  : worldRegion
+              }
+            >
+              {pinned.map(({ trip, centre }) => (
+                <Marker
+                  key={trip.id}
+                  coordinate={{ latitude: centre.lat, longitude: centre.lon }}
+                  onPress={() => {
+                    const stops = clusterIntoStops(trip.photos);
+                    const coords =
+                      stops.length > 0
+                        ? stops.map((s) => ({ lat: s.lat, lon: s.lon }))
+                        : trip.photos
+                            .filter((p) => p.lat !== null && p.lon !== null)
+                            .map((p) => ({ lat: p.lat!, lon: p.lon! }));
+                    setActiveTrip(trip);
+                    setSelectedTrip(trip);
+                    if (coords.length > 0) {
+                      mapRef.current?.animateToRegion(boundsForCoords(coords), 600);
+                    }
+                  }}
+                >
+                  <View style={styles.mapPin}>
+                    <View style={styles.mapPinDot} />
+                    <Text style={styles.mapPinLabel} numberOfLines={1}>
+                      {trip.name}
+                    </Text>
+                  </View>
+                </Marker>
+              ))}
+
+              {selectedTrip && selectedStops.length > 0 && (
+                <>
+                  <Polyline
+                    coordinates={selectedStops.map((s) => ({
+                      latitude: s.lat,
+                      longitude: s.lon,
+                    }))}
+                    strokeColor="#8b3a2f"
+                    strokeWidth={3}
+                  />
+                  {selectedStops.map((s, i) => (
+                    <Marker
+                      key={"stop-" + s.id}
+                      coordinate={{ latitude: s.lat, longitude: s.lon }}
+                      title={"Stop " + (i + 1)}
+                      description={
+                        s.photos.length +
+                        " photo" +
+                        (s.photos.length === 1 ? "" : "s") +
+                        " · tap to view"
+                      }
+                      onPress={() => {
+                        setStopgridReturn("globalmap");
+                        setActiveStop(s);
+                        setScreen("stopgrid");
+                      }}
+                    />
+                  ))}
+                </>
+              )}
+            </MapView>
+
+            {selectedTrip && (
+              <TouchableOpacity
+                style={styles.mapBackBtn}
                 onPress={() => {
-                  setActiveTrip(trip);
-                  setScreen("tripmap");
+                  setSelectedTrip(null);
+                  mapRef.current?.animateToRegion(worldRegion, 600);
                 }}
               >
-                <View style={styles.mapPin}>
-                  <View style={styles.mapPinDot} />
-                  <Text style={styles.mapPinLabel} numberOfLines={1}>
-                    {trip.name}
-                  </Text>
-                </View>
-              </Marker>
-            ))}
-          </MapView>
+                <Text style={styles.mapBackBtnText}>{"‹"} All trips</Text>
+              </TouchableOpacity>
+            )}
+          </>
         )}
       </View>
     );
@@ -543,8 +621,15 @@ export default function HomeScreen() {
     return (
       <View style={styles.screen}>
         <Header
-          title={`Stop ${stopIndex}  ·  ${activeStop.photos.length} photo${activeStop.photos.length === 1 ? "" : "s"}`}
-          onBack={() => setScreen("tripmap")}
+          title={
+            "Stop " +
+            stopIndex +
+            "  ·  " +
+            activeStop.photos.length +
+            " photo" +
+            (activeStop.photos.length === 1 ? "" : "s")
+          }
+          onBack={() => setScreen(stopgridReturn)}
           backLabel="Map"
         />
         <FlatList
@@ -614,9 +699,15 @@ export default function HomeScreen() {
             <Marker
               key={s.id}
               coordinate={{ latitude: s.lat, longitude: s.lon }}
-              title={`Stop ${i + 1}`}
-              description={`${s.photos.length} photo${s.photos.length === 1 ? "" : "s"} · tap to view`}
+              title={"Stop " + (i + 1)}
+              description={
+                s.photos.length +
+                " photo" +
+                (s.photos.length === 1 ? "" : "s") +
+                " · tap to view"
+              }
               onPress={() => {
+                setStopgridReturn("tripmap");
                 setActiveStop(s);
                 setScreen("stopgrid");
               }}
@@ -633,7 +724,7 @@ export default function HomeScreen() {
     return (
       <View style={styles.screen}>
         <Header
-          title={`${activeTrip.name} · Route`}
+          title={activeTrip.name + " · Route"}
           onBack={() => setScreen("album")}
           backLabel="Album"
         />
@@ -658,7 +749,7 @@ export default function HomeScreen() {
                 />
                 <View style={styles.stopMeta}>
                   <Text style={styles.stopName}>
-                    {item.placeName ?? "Locating…"}
+                    {item.placeName ?? "Locating..."}
                   </Text>
                   <Text style={styles.stopSub}>
                     {item.photos.length} photo
@@ -704,7 +795,7 @@ export default function HomeScreen() {
           style={styles.floatingBtn}
           onPress={() => setScreen("route")}
         >
-          <Text style={styles.primaryBtnText}>🗺️  View Route</Text>
+          <Text style={styles.primaryBtnText}>{"🗺️"}{"  "}View Route</Text>
         </TouchableOpacity>
       </View>
     );
@@ -729,7 +820,7 @@ export default function HomeScreen() {
             onChangeText={setTripName}
           />
 
-          <Text style={[styles.label, { marginTop: 24 }]}>Add this to…</Text>
+          <Text style={[styles.label, { marginTop: 24 }]}>Add this to...</Text>
           {(["album", "map", "both"] as Destination[]).map((d) => (
             <TouchableOpacity
               key={d}
@@ -783,7 +874,7 @@ export default function HomeScreen() {
         {loadingLib ? (
           <View style={styles.center}>
             <ActivityIndicator size="large" color="#8b3a2f" />
-            <Text style={styles.muted}>Loading your photos…</Text>
+            <Text style={styles.muted}>Loading your photos...</Text>
           </View>
         ) : (
           <>
@@ -888,15 +979,15 @@ export default function HomeScreen() {
                   <View style={styles.tripActions}>
                     {isEditing ? (
                       <TouchableOpacity style={styles.actionBtn} onPress={confirmEdit}>
-                        <Text style={styles.actionConfirm}>✓</Text>
+                        <Text style={styles.actionConfirm}>{"✓"}</Text>
                       </TouchableOpacity>
                     ) : (
                       <>
                         <TouchableOpacity style={styles.actionBtn} onPress={() => startEdit(item)}>
-                          <Text style={styles.actionIcon}>✏️</Text>
+                          <Text style={styles.actionIcon}>{"✏️"}</Text>
                         </TouchableOpacity>
                         <TouchableOpacity style={styles.actionBtn} onPress={() => deleteTrip(item.id)}>
-                          <Text style={styles.actionIcon}>🗑️</Text>
+                          <Text style={styles.actionIcon}>{"🗑️"}</Text>
                         </TouchableOpacity>
                       </>
                     )}
@@ -923,14 +1014,14 @@ export default function HomeScreen() {
         style={styles.button}
         onPress={() => setScreen("globalmap")}
       >
-        <Text style={styles.buttonText}>🌍  Global Map</Text>
+        <Text style={styles.buttonText}>{"🌍"}{"  "}Global Map</Text>
       </TouchableOpacity>
 
       <TouchableOpacity
         style={[styles.button, styles.buttonAlt]}
         onPress={() => setScreen("albums")}
       >
-        <Text style={styles.buttonText}>📔  Albums</Text>
+        <Text style={styles.buttonText}>{"📔"}{"  "}Albums</Text>
       </TouchableOpacity>
     </View>
   );
@@ -948,7 +1039,7 @@ function Header({
   return (
     <View style={styles.header}>
       <TouchableOpacity onPress={onBack} style={{ minWidth: 70 }}>
-        <Text style={styles.back}>‹ {backLabel}</Text>
+        <Text style={styles.back}>{"‹"} {backLabel}</Text>
       </TouchableOpacity>
       <Text style={styles.headerTitle} numberOfLines={1}>
         {title}
@@ -1059,6 +1150,25 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     overflow: "hidden",
     maxWidth: 120,
+  },
+  mapBackBtn: {
+    position: "absolute",
+    top: 110,
+    left: 16,
+    backgroundColor: "rgba(255,255,255,0.93)",
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    shadowColor: "#000",
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  mapBackBtnText: {
+    color: "#8b3a2f",
+    fontSize: 15,
+    fontWeight: "700",
   },
 
   primaryBtn: {
