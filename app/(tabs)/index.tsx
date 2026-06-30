@@ -198,7 +198,8 @@ type Screen =
   | "album"
   | "route"
   | "globalmap"
-  | "tripmap";
+  | "tripmap"
+  | "stopgrid";
 
 function ViewerPage({
   photo,
@@ -252,6 +253,7 @@ export default function HomeScreen() {
 
   const [activeTrip, setActiveTrip] = useState<Trip | null>(null);
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+  const [activeStop, setActiveStop] = useState<Stop | null>(null);
 
   const [editingTripId, setEditingTripId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
@@ -471,16 +473,49 @@ export default function HomeScreen() {
               <Marker
                 key={trip.id}
                 coordinate={{ latitude: centre.lat, longitude: centre.lon }}
-                title={trip.name}
-                description={`${trip.photos.length} photos`}
-                onCalloutPress={() => {
+                onPress={() => {
                   setActiveTrip(trip);
                   setScreen("tripmap");
                 }}
-              />
+              >
+                <View style={styles.mapPin}>
+                  <View style={styles.mapPinDot} />
+                  <Text style={styles.mapPinLabel} numberOfLines={1}>
+                    {trip.name}
+                  </Text>
+                </View>
+              </Marker>
             ))}
           </MapView>
         )}
+      </View>
+    );
+  }
+
+  // ---------- STOP PHOTO GRID ----------
+  if (screen === "stopgrid" && activeStop) {
+    const stopIndex = activeTrip
+      ? clusterIntoStops(activeTrip.photos).findIndex((s) => s.id === activeStop.id) + 1
+      : 1;
+    return (
+      <View style={styles.screen}>
+        <Header
+          title={`Stop ${stopIndex}  ·  ${activeStop.photos.length} photo${activeStop.photos.length === 1 ? "" : "s"}`}
+          onBack={() => setScreen("tripmap")}
+          backLabel="Map"
+        />
+        <FlatList
+          key="stopgrid-grid"
+          data={activeStop.photos}
+          keyExtractor={(p) => p.id}
+          numColumns={3}
+          contentContainerStyle={{ padding: 4, paddingBottom: 24 }}
+          renderItem={({ item }) => (
+            <View style={styles.pickCell}>
+              <Image source={{ uri: item.uri }} style={styles.gridThumb} />
+            </View>
+          )}
+        />
       </View>
     );
   }
@@ -533,7 +568,11 @@ export default function HomeScreen() {
               key={s.id}
               coordinate={{ latitude: s.lat, longitude: s.lon }}
               title={`Stop ${i + 1}`}
-              description={`${s.photos.length} photos`}
+              description={`${s.photos.length} photo${s.photos.length === 1 ? "" : "s"} · tap to view`}
+              onPress={() => {
+                setActiveStop(s);
+                setScreen("stopgrid");
+              }}
             />
           ))}
         </MapView>
@@ -994,6 +1033,28 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 3 },
     elevation: 4,
   },
+  mapPin: { alignItems: "center" },
+  mapPinDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: "#8b3a2f",
+    borderWidth: 2,
+    borderColor: "#fff",
+  },
+  mapPinLabel: {
+    marginTop: 3,
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#2b2b2b",
+    backgroundColor: "rgba(255,255,255,0.85)",
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 4,
+    overflow: "hidden",
+    maxWidth: 120,
+  },
+
   primaryBtn: {
     backgroundColor: "#8b3a2f",
     paddingVertical: 16,
