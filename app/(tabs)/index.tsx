@@ -1,6 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as MediaLibrary from "expo-media-library";
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -215,7 +215,6 @@ type Screen =
   | "picker"
   | "details"
   | "album"
-  | "route"
   | "globalmap"
   | "tripmap"
   | "stopgrid";
@@ -279,6 +278,11 @@ export default function HomeScreen() {
   const [selectedTrip, setSelectedTrip] = useState<Trip | null>(null);
   const [stopgridReturn, setStopgridReturn] = useState<Screen>("tripmap");
 
+  const [selectMode, setSelectMode] = useState(false);
+  const [gridSelectedIds, setGridSelectedIds] = useState<Set<string>>(new Set());
+  const [viewerDeletable, setViewerDeletable] = useState(false);
+  const [addToTripId, setAddToTripId] = useState<string | null>(null);
+
   const [editingTripId, setEditingTripId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
@@ -296,16 +300,18 @@ export default function HomeScreen() {
     }
   }, [trips, loadedFromStorage]);
 
-  async function openPicker() {
+  async function openPicker(addToId?: string) {
     setSelected([]);
+    setAddToTripId(addToId ?? null);
     setScreen("picker");
     setLoadingLib(true);
 
     const perm = await MediaLibrary.requestPermissionsAsync();
     if (!perm.granted) {
       setLoadingLib(false);
-      alert("Photo access is needed to build a trip.");
-      setScreen("albums");
+      alert("Photo access is needed.");
+      setAddToTripId(null);
+      setScreen(addToId ? "album" : "albums");
       return;
     }
 
@@ -388,6 +394,57 @@ export default function HomeScreen() {
     setScreen("albums");
   }
 
+  async function appendPhotosToTrip() {
+    if (!addToTripId) return;
+    setPreparing(true);
+
+    const targetTrip = trips.find((t) => t.id === addToTripId);
+    if (!targetTrip) {
+      setPreparing(false);
+      setAddToTripId(null);
+      setScreen("album");
+      return;
+    }
+
+    const existingIds = new Set(targetTrip.photos.map((p) => p.id));
+    const chosenBase = library.filter(
+      (p) => selected.includes(p.id) && !existingIds.has(p.id)
+    );
+
+    const enriched: Photo[] = [];
+    for (const p of chosenBase) {
+      try {
+        const info = await MediaLibrary.getAssetInfoAsync(p.asset!, {
+          shouldDownloadFromNetwork: true,
+        });
+        enriched.push({
+          ...p,
+          uri: info.localUri ?? p.uri,
+          lat: toNum(info.location?.latitude),
+          lon: toNum(info.location?.longitude),
+          asset: undefined,
+        });
+      } catch {
+        enriched.push({ ...p, asset: undefined });
+      }
+    }
+
+    const merged = [...targetTrip.photos, ...enriched].sort((a, b) => {
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return a.date.getTime() - b.date.getTime();
+    });
+
+    const updatedTrip = { ...targetTrip, photos: merged };
+    setTrips((prev) => prev.map((t) => (t.id === addToTripId ? updatedTrip : t)));
+    setActiveTrip(updatedTrip);
+
+    setSelected([]);
+    setPreparing(false);
+    setAddToTripId(null);
+    setScreen("album");
+  }
+
   function saveCaptionTo(photoId: string, text: string) {
     setActiveTrip((prev) => {
       if (!prev) return prev;
@@ -402,9 +459,10 @@ export default function HomeScreen() {
     });
   }
 
-  function openViewer(photos: Photo[], index: number) {
+  function openViewer(photos: Photo[], index: number, deletable = false) {
     setViewerPhotos(photos);
     setViewerIndex(index);
+    setViewerDeletable(deletable);
   }
 
   function closeViewer() {
@@ -419,6 +477,105 @@ export default function HomeScreen() {
       Keyboard.dismiss();
       setViewerIndex(newIndex);
     }
+  }
+
+  function removePhotosFromAlbum(
+    tripId: string,
+    photoIds: string[],
+    emptyReturnTo?: Screen
+  ) {
+    const idSet = new Set(photoIds);
+    const currentTrip = trips.find((t) => t.id === tripId);
+    const willBeEmpty =
+      currentTrip !== undefined &&
+      currentTrip.photos.filter((p) => !idSet.has(p.id)).length === 0;
+
+    if (willBeEmpty) {
+      setTrips((prev) => prev.filter((t) => t.id !== tripId));
+      setActiveTrip(null);
+      setActiveStop(null);
+      setSelectedTrip((prev) => (prev?.id === tripId ? null : prev));
+      exitSelectMode();
+      setScreen(emptyReturnTo ?? (screen === "stopgrid" ? "globalmap" : "albums"));
+    } else {
+      setTrips((prev) =>
+        prev.map((t) =>
+          t.id === tripId
+            ? { ...t, photos: t.photos.filter((p) => !idSet.has(p.id)) }
+            : t
+        )
+      );
+      setActiveTrip((prev) =>
+        prev && prev.id === tripId
+          ? { ...prev, photos: prev.photos.filter((p) => !idSet.has(p.id)) }
+          : prev
+      );
+      setActiveStop((prev) =>
+        prev ? { ...prev, photos: prev.photos.filter((p) => !idSet.has(p.id)) } : prev
+      );
+    }
+  }
+
+  function deleteViewerPhoto() {
+    if (viewerIndex === null || !activeTrip) return;
+    const currentPhoto = viewerPhotos[viewerIndex];
+    const emptyReturnTo: Screen = screen === "stopgrid" ? "globalmap" : "albums";
+    Alert.alert(
+      "Remove from album?",
+      "This photo will be removed from the trip but not deleted from your camera roll.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: () => {
+            const newPhotos = viewerPhotos.filter((p) => p.id !== currentPhoto.id);
+            if (newPhotos.length === 0) {
+              closeViewer();
+            } else {
+              setViewerPhotos(newPhotos);
+              setViewerIndex(Math.min(viewerIndex, newPhotos.length - 1));
+            }
+            removePhotosFromAlbum(activeTrip.id, [currentPhoto.id], emptyReturnTo);
+          },
+        },
+      ]
+    );
+  }
+
+  function exitSelectMode() {
+    setSelectMode(false);
+    setGridSelectedIds(new Set());
+  }
+
+  function toggleGridSelect(id: string) {
+    setGridSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function confirmDeleteSelected() {
+    const ids = Array.from(gridSelectedIds);
+    if (!activeTrip || ids.length === 0) return;
+    const emptyReturnTo: Screen = screen === "stopgrid" ? "globalmap" : "albums";
+    Alert.alert(
+      `Remove ${ids.length} photo${ids.length === 1 ? "" : "s"}?`,
+      "They will be removed from this trip but not deleted from your camera roll.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: () => {
+            removePhotosFromAlbum(activeTrip.id, ids, emptyReturnTo);
+            exitSelectMode();
+          },
+        },
+      ]
+    );
   }
 
   function deleteTrip(id: string) {
@@ -476,7 +633,14 @@ export default function HomeScreen() {
           <Text style={styles.viewerCloseText}>{"✕"}</Text>
         </TouchableOpacity>
 
+        {viewerDeletable && activeTrip && (
+          <TouchableOpacity style={styles.viewerTrash} onPress={deleteViewerPhoto}>
+            <Text style={styles.viewerTrashIcon}>{"🗑"}</Text>
+          </TouchableOpacity>
+        )}
+
         <FlatList
+          key={`viewer-${viewerPhotos.length}`}
           data={viewerPhotos}
           keyExtractor={(p) => p.id}
           horizontal
@@ -536,33 +700,36 @@ export default function HomeScreen() {
                   : worldRegion
               }
             >
-              {pinned.map(({ trip, centre }) => (
-                <Marker
-                  key={trip.id}
-                  coordinate={{ latitude: centre.lat, longitude: centre.lon }}
-                  onPress={() => {
-                    const stops = clusterIntoStops(trip.photos);
-                    const coords =
-                      stops.length > 0
-                        ? stops.map((s) => ({ lat: s.lat, lon: s.lon }))
-                        : trip.photos
-                            .filter((p) => p.lat !== null && p.lon !== null)
-                            .map((p) => ({ lat: p.lat!, lon: p.lon! }));
-                    setActiveTrip(trip);
-                    setSelectedTrip(trip);
-                    if (coords.length > 0) {
-                      mapRef.current?.animateToRegion(boundsForCoords(coords), 600);
-                    }
-                  }}
-                >
-                  <View style={styles.mapPin}>
-                    <View style={styles.mapPinDot} />
-                    <Text style={styles.mapPinLabel} numberOfLines={1}>
-                      {trip.name}
-                    </Text>
-                  </View>
-                </Marker>
-              ))}
+              {pinned.map(({ trip, centre }) => {
+                if (selectedTrip && trip.id === selectedTrip.id) return null;
+                return (
+                  <Marker
+                    key={trip.id}
+                    coordinate={{ latitude: centre.lat, longitude: centre.lon }}
+                    onPress={() => {
+                      const stops = clusterIntoStops(trip.photos);
+                      const coords =
+                        stops.length > 0
+                          ? stops.map((s) => ({ lat: s.lat, lon: s.lon }))
+                          : trip.photos
+                              .filter((p) => p.lat !== null && p.lon !== null)
+                              .map((p) => ({ lat: p.lat!, lon: p.lon! }));
+                      setActiveTrip(trip);
+                      setSelectedTrip(trip);
+                      if (coords.length > 0) {
+                        mapRef.current?.animateToRegion(boundsForCoords(coords), 600);
+                      }
+                    }}
+                  >
+                    <View style={styles.mapPin}>
+                      <View style={styles.mapPinDot} />
+                      <Text style={styles.mapPinLabel} numberOfLines={1}>
+                        {trip.name}
+                      </Text>
+                    </View>
+                  </Marker>
+                );
+              })}
 
               {selectedTrip && selectedStops.length > 0 && (
                 <>
@@ -618,36 +785,98 @@ export default function HomeScreen() {
     const stopIndex = activeTrip
       ? clusterIntoStops(activeTrip.photos).findIndex((s) => s.id === activeStop.id) + 1
       : 1;
+    const stopIsEmpty = activeStop.photos.length === 0;
     return (
       <View style={styles.screen}>
         <Header
           title={
             "Stop " +
-            stopIndex +
+            (stopIndex > 0 ? stopIndex : "?") +
             "  ·  " +
             activeStop.photos.length +
             " photo" +
             (activeStop.photos.length === 1 ? "" : "s")
           }
-          onBack={() => setScreen(stopgridReturn)}
+          onBack={() => {
+            exitSelectMode();
+            setScreen(stopgridReturn);
+          }}
           backLabel="Map"
+          rightAction={
+            !stopIsEmpty && activeTrip ? (
+              selectMode ? (
+                <TouchableOpacity onPress={exitSelectMode}>
+                  <Text style={styles.headerAction}>Cancel</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity onPress={() => setSelectMode(true)}>
+                  <Text style={styles.headerAction}>Select</Text>
+                </TouchableOpacity>
+              )
+            ) : undefined
+          }
         />
-        <FlatList
-          key="stopgrid-grid"
-          data={activeStop.photos}
-          keyExtractor={(p) => p.id}
-          numColumns={3}
-          contentContainerStyle={{ padding: 4, paddingBottom: 24 }}
-          renderItem={({ item, index }) => (
-            <TouchableOpacity
-              style={styles.pickCell}
-              onPress={() => openViewer(activeStop!.photos, index)}
-              activeOpacity={0.85}
-            >
-              <Image source={{ uri: item.uri }} style={styles.gridThumb} />
+        {stopIsEmpty ? (
+          <View style={styles.center}>
+            <Text style={styles.muted}>No photos in this stop.</Text>
+          </View>
+        ) : (
+          <FlatList
+            key="stopgrid-grid"
+            data={activeStop.photos}
+            keyExtractor={(p) => p.id}
+            numColumns={3}
+            contentContainerStyle={{ padding: 4, paddingBottom: selectMode ? 90 : 24 }}
+            renderItem={({ item, index }) => {
+              const isSelected = gridSelectedIds.has(item.id);
+              return (
+                <TouchableOpacity
+                  style={styles.pickCell}
+                  onPress={() => {
+                    if (selectMode) {
+                      toggleGridSelect(item.id);
+                    } else {
+                      openViewer(activeStop!.photos, index, !!activeTrip);
+                    }
+                  }}
+                  activeOpacity={0.85}
+                >
+                  <Image source={{ uri: item.uri }} style={styles.gridThumb} />
+                  {selectMode && (
+                    isSelected ? (
+                      <View style={styles.selectCheck}>
+                        <Text style={styles.selectCheckText}>{"✓"}</Text>
+                      </View>
+                    ) : (
+                      <View style={styles.selectCircle} />
+                    )
+                  )}
+                </TouchableOpacity>
+              );
+            }}
+          />
+        )}
+        {selectMode && (
+          <View style={styles.selectBar}>
+            <TouchableOpacity onPress={exitSelectMode} style={styles.selectBarCancel}>
+              <Text style={styles.selectBarCancelText}>Cancel</Text>
             </TouchableOpacity>
-          )}
-        />
+            <TouchableOpacity
+              style={[
+                styles.selectBarDelete,
+                gridSelectedIds.size === 0 && styles.selectBarDeleteDisabled,
+              ]}
+              onPress={confirmDeleteSelected}
+              disabled={gridSelectedIds.size === 0}
+            >
+              <Text style={styles.selectBarDeleteText}>
+                {gridSelectedIds.size > 0
+                  ? `Delete (${gridSelectedIds.size})`
+                  : "Delete"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </View>
     );
   }
@@ -718,85 +947,101 @@ export default function HomeScreen() {
     );
   }
 
-  // ---------- ROUTE / STOPS (list) ----------
-  if (screen === "route" && activeTrip) {
-    const stops = clusterIntoStops(activeTrip.photos);
-    return (
-      <View style={styles.screen}>
-        <Header
-          title={activeTrip.name + " · Route"}
-          onBack={() => setScreen("album")}
-          backLabel="Album"
-        />
-        {stops.length === 0 ? (
-          <View style={styles.center}>
-            <Text style={styles.muted}>No location data on these photos.</Text>
-          </View>
-        ) : (
-          <FlatList
-            key="route-list"
-            data={stops}
-            keyExtractor={(s) => s.id}
-            contentContainerStyle={{ padding: 12 }}
-            renderItem={({ item, index }) => (
-              <View style={styles.stopCard}>
-                <View style={styles.stopNumber}>
-                  <Text style={styles.stopNumberText}>{index + 1}</Text>
-                </View>
-                <Image
-                  source={{ uri: item.photos[0].uri }}
-                  style={styles.stopCover}
-                />
-                <View style={styles.stopMeta}>
-                  <Text style={styles.stopName}>
-                    {item.placeName ?? "Locating..."}
-                  </Text>
-                  <Text style={styles.stopSub}>
-                    {item.photos.length} photo
-                    {item.photos.length === 1 ? "" : "s"}
-                    {"  ·  "}
-                    {item.lat.toFixed(3)}, {item.lon.toFixed(3)}
-                  </Text>
-                </View>
-              </View>
-            )}
-          />
-        )}
-      </View>
-    );
-  }
-
   // ---------- VIEW AN ALBUM (grid) ----------
   if (screen === "album" && activeTrip) {
+    const isEmpty = activeTrip.photos.length === 0;
     return (
       <View style={styles.screen}>
         <Header
           title={activeTrip.name}
-          onBack={() => setScreen("albums")}
+          onBack={() => {
+            exitSelectMode();
+            setScreen("albums");
+          }}
           backLabel="Albums"
+          rightAction={
+            !isEmpty ? (
+              selectMode ? (
+                <TouchableOpacity onPress={exitSelectMode}>
+                  <Text style={styles.headerAction}>Cancel</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity onPress={() => setSelectMode(true)}>
+                  <Text style={styles.headerAction}>Select</Text>
+                </TouchableOpacity>
+              )
+            ) : undefined
+          }
         />
-        <FlatList
-          key="album-grid"
-          data={activeTrip.photos}
-          keyExtractor={(p) => p.id}
-          numColumns={3}
-          contentContainerStyle={{ padding: 4, paddingBottom: 90 }}
-          renderItem={({ item, index }) => (
-            <TouchableOpacity
-              style={styles.pickCell}
-              onPress={() => openViewer(activeTrip!.photos, index)}
-              activeOpacity={0.85}
-            >
-              <Image source={{ uri: item.uri }} style={styles.gridThumb} />
+        {isEmpty ? (
+          <View style={styles.center}>
+            <Text style={styles.muted}>No photos in this album.</Text>
+          </View>
+        ) : (
+          <FlatList
+            key="album-grid"
+            data={activeTrip.photos}
+            keyExtractor={(p) => p.id}
+            numColumns={3}
+            contentContainerStyle={{ padding: 4, paddingBottom: 90 }}
+            renderItem={({ item, index }) => {
+              const isSelected = gridSelectedIds.has(item.id);
+              return (
+                <TouchableOpacity
+                  style={styles.pickCell}
+                  onPress={() => {
+                    if (selectMode) {
+                      toggleGridSelect(item.id);
+                    } else {
+                      openViewer(activeTrip!.photos, index, true);
+                    }
+                  }}
+                  activeOpacity={0.85}
+                >
+                  <Image source={{ uri: item.uri }} style={styles.gridThumb} />
+                  {selectMode && (
+                    isSelected ? (
+                      <View style={styles.selectCheck}>
+                        <Text style={styles.selectCheckText}>{"✓"}</Text>
+                      </View>
+                    ) : (
+                      <View style={styles.selectCircle} />
+                    )
+                  )}
+                </TouchableOpacity>
+              );
+            }}
+          />
+        )}
+        {!selectMode && (
+          <TouchableOpacity
+            style={styles.floatingBtn}
+            onPress={() => openPicker(activeTrip!.id)}
+          >
+            <Text style={styles.primaryBtnText}>{"+"}{" "}{"  "}Add Photos</Text>
+          </TouchableOpacity>
+        )}
+        {selectMode && (
+          <View style={styles.selectBar}>
+            <TouchableOpacity onPress={exitSelectMode} style={styles.selectBarCancel}>
+              <Text style={styles.selectBarCancelText}>Cancel</Text>
             </TouchableOpacity>
-          )}
-        />
-        <TouchableOpacity
-          style={styles.floatingBtn}
-          onPress={() => setScreen("route")}
-        >
-          <Text style={styles.primaryBtnText}>{"🗺️"}{"  "}View Route</Text>
-        </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.selectBarDelete,
+                gridSelectedIds.size === 0 && styles.selectBarDeleteDisabled,
+              ]}
+              onPress={confirmDeleteSelected}
+              disabled={gridSelectedIds.size === 0}
+            >
+              <Text style={styles.selectBarDeleteText}>
+                {gridSelectedIds.size > 0
+                  ? `Delete (${gridSelectedIds.size})`
+                  : "Delete"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </View>
     );
   }
@@ -867,9 +1112,13 @@ export default function HomeScreen() {
     return (
       <View style={styles.screen}>
         <Header
-          title="Select Photos"
-          onBack={() => setScreen("albums")}
-          backLabel="Albums"
+          title={addToTripId ? "Add Photos" : "Select Photos"}
+          onBack={() => {
+            setAddToTripId(null);
+            setSelected([]);
+            setScreen(addToTripId ? "album" : "albums");
+          }}
+          backLabel={addToTripId ? "Album" : "Albums"}
         />
         {loadingLib ? (
           <View style={styles.center}>
@@ -906,11 +1155,18 @@ export default function HomeScreen() {
             {selected.length > 0 && (
               <TouchableOpacity
                 style={styles.floatingBtn}
-                onPress={() => setScreen("details")}
+                onPress={addToTripId ? appendPhotosToTrip : () => setScreen("details")}
+                disabled={preparing}
               >
-                <Text style={styles.primaryBtnText}>
-                  Next  ({selected.length})
-                </Text>
+                {preparing && addToTripId ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.primaryBtnText}>
+                    {addToTripId
+                      ? `Add  (${selected.length})`
+                      : `Next  (${selected.length})`}
+                  </Text>
+                )}
               </TouchableOpacity>
             )}
           </>
@@ -997,7 +1253,7 @@ export default function HomeScreen() {
             }}
           />
         )}
-        <TouchableOpacity style={styles.floatingBtn} onPress={openPicker}>
+        <TouchableOpacity style={styles.floatingBtn} onPress={() => openPicker()}>
           <Text style={styles.primaryBtnText}>+  New Trip</Text>
         </TouchableOpacity>
       </View>
@@ -1031,10 +1287,12 @@ function Header({
   title,
   onBack,
   backLabel,
+  rightAction,
 }: {
   title: string;
   onBack: () => void;
   backLabel: string;
+  rightAction?: React.ReactNode;
 }) {
   return (
     <View style={styles.header}>
@@ -1044,7 +1302,9 @@ function Header({
       <Text style={styles.headerTitle} numberOfLines={1}>
         {title}
       </Text>
-      <View style={{ minWidth: 70 }} />
+      <View style={{ minWidth: 70, alignItems: "flex-end" }}>
+        {rightAction}
+      </View>
     </View>
   );
 }
@@ -1233,29 +1493,6 @@ const styles = StyleSheet.create({
   actionIcon: { fontSize: 18 },
   actionConfirm: { fontSize: 22, color: "#8b3a2f", fontWeight: "700" },
 
-  stopCard: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#fff",
-    borderRadius: 12,
-    padding: 10,
-    marginBottom: 10,
-  },
-  stopNumber: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: "#8b3a2f",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 10,
-  },
-  stopNumberText: { color: "#fff", fontWeight: "700", fontSize: 14 },
-  stopCover: { width: 60, height: 60, borderRadius: 8, backgroundColor: "#eee" },
-  stopMeta: { marginLeft: 12, flex: 1 },
-  stopName: { fontSize: 16, fontWeight: "700", color: "#2b2b2b" },
-  stopSub: { fontSize: 12, color: "#9a8c7a", marginTop: 4 },
-
   viewer: { flex: 1, backgroundColor: "#000" },
   viewerHeader: {
     position: "absolute",
@@ -1297,4 +1534,70 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 3,
   },
+
+  viewerTrash: {
+    position: "absolute",
+    top: 52,
+    left: 20,
+    zIndex: 10,
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  viewerTrashIcon: { fontSize: 22 },
+
+  headerAction: { color: "#8b3a2f", fontSize: 16, fontWeight: "600" },
+
+  selectCheck: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: "#8b3a2f",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    borderColor: "#fff",
+  },
+  selectCheckText: { color: "#fff", fontWeight: "700", fontSize: 14 },
+  selectCircle: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.85)",
+    backgroundColor: "rgba(0,0,0,0.15)",
+  },
+
+  selectBar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingTop: 14,
+    paddingBottom: 36,
+    backgroundColor: "rgba(250,248,245,0.97)",
+    borderTopWidth: 1,
+    borderTopColor: "#e2d8cc",
+  },
+  selectBarCancel: { paddingVertical: 4 },
+  selectBarCancelText: { fontSize: 16, color: "#9a8c7a", fontWeight: "600" },
+  selectBarDelete: {
+    backgroundColor: "#8b3a2f",
+    paddingVertical: 10,
+    paddingHorizontal: 28,
+    borderRadius: 22,
+  },
+  selectBarDeleteDisabled: { backgroundColor: "#c9a99a" },
+  selectBarDeleteText: { color: "#fff", fontWeight: "700", fontSize: 15 },
 });
