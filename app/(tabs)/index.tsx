@@ -10,6 +10,7 @@ import {
   FlatList,
   Image,
   Keyboard,
+  KeyboardAvoidingView,
   Platform,
   ScrollView,
   StyleSheet,
@@ -18,13 +19,22 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { Directions, Gesture, GestureDetector } from "react-native-gesture-handler";
 import MapView, { Marker, Polyline } from "react-native-maps";
+import Animated, {
+  Easing,
+  FadeInUp,
+  FadeOut,
+  runOnJS,
+  withTiming,
+} from "react-native-reanimated";
 
 import { Atlas } from "@/constants/theme";
 
 const SCREEN_W = Dimensions.get("window").width;
 const STOP_RADIUS_KM = 5;
 const STORAGE_KEY = "trips_v1";
+const STORY_STORAGE_KEY = "storyboards_v1";
 
 // Photo grids: fixed-size cells (fractional flex + aspectRatio misbehaves
 // in FlatList rows on RN 0.81, collapsing rows after the first).
@@ -66,6 +76,19 @@ type Stop = {
   lat: number;
   lon: number;
   placeName: string | null;
+};
+
+// A curated story: an ordered sequence of pages, each referencing a photo in
+// the source trip by id (so photo URIs stay fresh via the trip-loading path)
+// with its own caption, independent of the album caption.
+type StoryPage = { photoId: string; caption: string };
+
+type Storyboard = {
+  id: string;
+  title: string;
+  sourceTripId: string;
+  pages: StoryPage[];
+  createdAt: number;
 };
 
 function toNum(v: unknown): number | null {
@@ -136,26 +159,8 @@ async function pickedToPhotos(
   return photos;
 }
 
-function fmtDay(d: Date): string {
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
-}
-
 function fmtStamp(d: Date): string {
   return `${d.getDate()} ${MONTHS[d.getMonth()].toUpperCase()} ${d.getFullYear()}`;
-}
-
-function toRoman(n: number): string {
-  const table: [number, string][] = [
-    [10, "X"], [9, "IX"], [5, "V"], [4, "IV"], [1, "I"],
-  ];
-  let out = "";
-  for (const [v, s] of table) {
-    while (n >= v) {
-      out += s;
-      n -= v;
-    }
-  }
-  return out || "I";
 }
 
 // ---------- PERSISTENCE ----------
@@ -223,6 +228,73 @@ async function loadTripsFromStorage(): Promise<Trip[]> {
     return [];
   }
 }
+
+async function saveStoryboardsToStorage(storyboards: Storyboard[]) {
+  try {
+    await AsyncStorage.setItem(STORY_STORAGE_KEY, JSON.stringify(storyboards));
+  } catch {
+    // ignore write errors for now
+  }
+}
+
+async function loadStoryboardsFromStorage(): Promise<Storyboard[]> {
+  try {
+    const raw = await AsyncStorage.getItem(STORY_STORAGE_KEY);
+    if (!raw) return [];
+    const plain = JSON.parse(raw) as any[];
+    return plain.map((s) => ({
+      id: String(s.id),
+      title: String(s.title ?? "Untitled story"),
+      sourceTripId: String(s.sourceTripId),
+      pages: Array.isArray(s.pages)
+        ? s.pages.map((p: any) => ({
+            photoId: String(p.photoId),
+            caption: String(p.caption ?? ""),
+          }))
+        : [],
+      createdAt: typeof s.createdAt === "number" ? s.createdAt : 0,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// Resolve a storyboard's pages against the loaded trips. Pages whose photo
+// was removed from the source trip (or whose trip was deleted) drop out.
+function resolveStoryPages(
+  sb: Storyboard,
+  trips: Trip[]
+): { photo: Photo; caption: string }[] {
+  const trip = trips.find((t) => t.id === sb.sourceTripId);
+  if (!trip) return [];
+  const byId = new Map(trip.photos.map((p) => [p.id, p]));
+  const out: { photo: Photo; caption: string }[] = [];
+  for (const pg of sb.pages) {
+    const photo = byId.get(pg.photoId);
+    if (photo) out.push({ photo, caption: pg.caption });
+  }
+  return out;
+}
+
+// Nostalgic page entrance: the incoming page fades in while gently settling
+// from a slight zoom, like a print being laid onto the desk.
+const storyPageEnter = () => {
+  "worklet";
+  return {
+    initialValues: { opacity: 0, transform: [{ scale: 1.06 }] },
+    animations: {
+      opacity: withTiming(1, { duration: 550, easing: Easing.out(Easing.quad) }),
+      transform: [
+        {
+          scale: withTiming(1, {
+            duration: 1400,
+            easing: Easing.out(Easing.cubic),
+          }),
+        },
+      ],
+    },
+  };
+};
 
 function distanceKm(
   a: { lat: number; lon: number },
@@ -310,32 +382,17 @@ function boundsForCoords(
   };
 }
 
-function groupPhotosByDay(photos: Photo[]): { key: string; date: Date | null; photos: Photo[] }[] {
-  const dated = photos
-    .filter((p) => p.date)
-    .sort((a, b) => a.date!.getTime() - b.date!.getTime());
-  const undated = photos.filter((p) => !p.date);
-
-  const pages: { key: string; date: Date | null; photos: Photo[] }[] = [];
-  for (const p of dated) {
-    const key = p.date!.toDateString();
-    const last = pages[pages.length - 1];
-    if (last && last.key === key) last.photos.push(p);
-    else pages.push({ key, date: p.date, photos: [p] });
-  }
-  if (undated.length > 0) {
-    pages.push({ key: "undated", date: null, photos: undated });
-  }
-  return pages;
-}
-
 type Screen =
   | "albums"
   | "details"
   | "album"
   | "globalmap"
   | "stopgrid"
-  | "storybook";
+  | "storybook"
+  | "sbPickAlbum"
+  | "sbPickPhotos"
+  | "sbArrange"
+  | "sbViewer";
 
 type Tab = "albums" | "globalmap" | "storybook";
 
@@ -478,13 +535,28 @@ export default function HomeScreen() {
   const [editingTripId, setEditingTripId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
-  const [storyTripId, setStoryTripId] = useState<string | null>(null);
-  const [storyDay, setStoryDay] = useState(0);
+  const [storyboards, setStoryboards] = useState<Storyboard[]>([]);
+  const [editingStoryId, setEditingStoryId] = useState<string | null>(null);
+  const [editingStoryName, setEditingStoryName] = useState("");
+
+  // Create-flow draft
+  const [sbSourceTrip, setSbSourceTrip] = useState<Trip | null>(null);
+  const [sbSelectedIds, setSbSelectedIds] = useState<string[]>([]);
+  const [sbDraftPages, setSbDraftPages] = useState<StoryPage[]>([]);
+  const [sbTitle, setSbTitle] = useState("");
+
+  // Playback
+  const [activeStory, setActiveStory] = useState<Storyboard | null>(null);
+  const [storyPageIdx, setStoryPageIdx] = useState(0);
 
   useEffect(() => {
     (async () => {
-      const saved = await loadTripsFromStorage();
-      setTrips(saved);
+      const [savedTrips, savedStories] = await Promise.all([
+        loadTripsFromStorage(),
+        loadStoryboardsFromStorage(),
+      ]);
+      setTrips(savedTrips);
+      setStoryboards(savedStories);
       setLoadedFromStorage(true);
     })();
   }, []);
@@ -494,6 +566,12 @@ export default function HomeScreen() {
       saveTripsToStorage(trips);
     }
   }, [trips, loadedFromStorage]);
+
+  useEffect(() => {
+    if (loadedFromStorage) {
+      saveStoryboardsToStorage(storyboards);
+    }
+  }, [storyboards, loadedFromStorage]);
 
   async function openPicker(addToId?: string) {
     // Media-library access (not needed by the native picker itself) lets us
@@ -751,6 +829,132 @@ export default function HomeScreen() {
     ]);
   }
 
+  function deleteStoryboard(id: string) {
+    Alert.alert("Delete storyboard", "The photos stay in your albums.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: () => setStoryboards((prev) => prev.filter((s) => s.id !== id)),
+      },
+    ]);
+  }
+
+  function startEditStory(sb: Storyboard) {
+    setEditingStoryId(sb.id);
+    setEditingStoryName(sb.title);
+  }
+
+  function confirmEditStory() {
+    if (!editingStoryId) return;
+    const trimmed = editingStoryName.trim();
+    if (trimmed) {
+      setStoryboards((prev) =>
+        prev.map((s) => (s.id === editingStoryId ? { ...s, title: trimmed } : s))
+      );
+    }
+    setEditingStoryId(null);
+    setEditingStoryName("");
+  }
+
+  function startCreateStoryboard() {
+    setSbSourceTrip(null);
+    setSbSelectedIds([]);
+    setSbDraftPages([]);
+    setSbTitle("");
+    setScreen("sbPickAlbum");
+  }
+
+  function openStoryViewer(sb: Storyboard) {
+    const pages = resolveStoryPages(sb, trips);
+    if (pages.length === 0) {
+      Alert.alert(
+        "Nothing to show",
+        "The photos for this storyboard are no longer in its source album."
+      );
+      return;
+    }
+    setActiveStory(sb);
+    setStoryPageIdx(0);
+    setScreen("sbViewer");
+  }
+
+  function toggleSbSelect(id: string) {
+    setSbSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  }
+
+  // Selection order seeds the page order; album captions seed the story
+  // captions. Both are freely editable on the arrange screen. Returning here
+  // after tweaking the selection keeps existing pages (order and typed
+  // captions intact), drops deselected ones, and appends new picks at the end.
+  function beginArrange() {
+    if (!sbSourceTrip) return;
+    const byId = new Map(sbSourceTrip.photos.map((p) => [p.id, p]));
+    setSbDraftPages((prev) => {
+      const selected = new Set(sbSelectedIds);
+      const kept = prev.filter((pg) => selected.has(pg.photoId));
+      const keptIds = new Set(kept.map((pg) => pg.photoId));
+      const added = sbSelectedIds
+        .filter((id) => !keptIds.has(id))
+        .map((photoId) => ({
+          photoId,
+          caption: byId.get(photoId)?.caption ?? "",
+        }));
+      return [...kept, ...added];
+    });
+    setScreen("sbArrange");
+  }
+
+  function moveDraftPage(index: number, dir: -1 | 1) {
+    setSbDraftPages((prev) => {
+      const j = index + dir;
+      if (j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[index], next[j]] = [next[j], next[index]];
+      return next;
+    });
+  }
+
+  function setDraftCaption(index: number, text: string) {
+    setSbDraftPages((prev) =>
+      prev.map((pg, i) => (i === index ? { ...pg, caption: text } : pg))
+    );
+  }
+
+  function removeDraftPage(index: number) {
+    const removed = sbDraftPages[index];
+    if (!removed) return;
+    setSbDraftPages((prev) => prev.filter((_, i) => i !== index));
+    setSbSelectedIds((prev) => prev.filter((id) => id !== removed.photoId));
+  }
+
+  function saveStoryboard() {
+    if (!sbSourceTrip || sbDraftPages.length === 0) return;
+    const sb: Storyboard = {
+      id: Date.now().toString(),
+      title: sbTitle.trim() || "Untitled story",
+      sourceTripId: sbSourceTrip.id,
+      pages: sbDraftPages.map((pg) => ({ ...pg, caption: pg.caption.trim() })),
+      createdAt: Date.now(),
+    };
+    setStoryboards((prev) => [sb, ...prev]);
+    setSbSourceTrip(null);
+    setSbSelectedIds([]);
+    setSbDraftPages([]);
+    setSbTitle("");
+    setScreen("storybook");
+  }
+
+  function storyCardMenu(sb: Storyboard) {
+    Alert.alert(sb.title, undefined, [
+      { text: "Rename", onPress: () => startEditStory(sb) },
+      { text: "Delete", style: "destructive", onPress: () => deleteStoryboard(sb.id) },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  }
+
   function goTab(tab: Tab) {
     exitSelectMode();
     setScreen(tab);
@@ -955,7 +1159,7 @@ export default function HomeScreen() {
                             s.photos.length +
                             " photo" +
                             (s.photos.length === 1 ? "" : "s") +
-                            " · tap to view"
+                            " Â· tap to view"
                           }
                           onPress={() => {
                             setStopgridReturn("globalmap");
@@ -1292,235 +1496,446 @@ export default function HomeScreen() {
     );
   }
 
-  // ---------- STORYBOOK ----------
+  // ---------- STORYBOARD: PICK SOURCE ALBUM ----------
+  if (screen === "sbPickAlbum") {
+    const candidates = trips.filter((t) => t.photos.length > 0);
+    return (
+      <View style={styles.screen}>
+        <SubHeader
+          title="New Storyboard"
+          subtitle="choose a source album"
+          onBack={() => setScreen("storybook")}
+          backLabel="Stories"
+        />
+        {candidates.length === 0 ? (
+          <View style={styles.center}>
+            <MaterialIcons name="photo-library" size={36} color={Atlas.color.outline} />
+            <Text style={styles.emptyText}>
+              No albums with photos yet.{"\n"}Create a trip first, then tell its story.
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            key="sb-album-list"
+            data={candidates}
+            keyExtractor={(t) => t.id}
+            contentContainerStyle={styles.sbAlbumList}
+            renderItem={({ item }) => (
+              <TouchableOpacity
+                style={styles.sbAlbumRow}
+                activeOpacity={0.85}
+                onPress={() => {
+                  setSbSourceTrip(item);
+                  setSbSelectedIds([]);
+                  setScreen("sbPickPhotos");
+                }}
+              >
+                <Image
+                  source={{ uri: item.photos[0].uri }}
+                  style={styles.sbAlbumThumb}
+                />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.sbAlbumName} numberOfLines={1}>
+                    {item.name}
+                  </Text>
+                  <Text style={styles.sbAlbumCount}>
+                    {item.photos.length} photo{item.photos.length === 1 ? "" : "s"}
+                  </Text>
+                </View>
+                <MaterialIcons
+                  name="chevron-right"
+                  size={22}
+                  color={Atlas.color.onSurfaceVariant}
+                />
+              </TouchableOpacity>
+            )}
+          />
+        )}
+      </View>
+    );
+  }
+
+  // ---------- STORYBOARD: PICK PHOTOS (in story order) ----------
+  if (screen === "sbPickPhotos" && sbSourceTrip) {
+    return (
+      <View style={styles.screen}>
+        <SubHeader
+          title={sbSourceTrip.name}
+          subtitle="tap photos in story order"
+          onBack={() => setScreen("sbPickAlbum")}
+          backLabel="Albums"
+        />
+        <FlatList
+          key="sb-pick-grid"
+          data={sbSourceTrip.photos}
+          keyExtractor={(p) => p.id}
+          numColumns={GRID_COLS}
+          columnWrapperStyle={styles.gridRow}
+          contentContainerStyle={{ padding: GRID_PADDING, paddingBottom: 110 }}
+          renderItem={({ item }) => {
+            const idx = sbSelectedIds.indexOf(item.id);
+            const isSel = idx !== -1;
+            return (
+              <TouchableOpacity
+                style={styles.pickCell}
+                onPress={() => toggleSbSelect(item.id)}
+                activeOpacity={0.8}
+              >
+                <Image source={{ uri: item.uri }} style={styles.gridThumb} />
+                {isSel && (
+                  <View style={styles.badge}>
+                    <Text style={styles.badgeText}>{idx + 1}</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
+            );
+          }}
+        />
+        {sbSelectedIds.length > 0 && (
+          <TouchableOpacity style={styles.primaryPill} onPress={beginArrange}>
+            <Text style={styles.primaryPillText}>
+              Next  ({sbSelectedIds.length})
+            </Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    );
+  }
+
+  // ---------- STORYBOARD: ARRANGE PAGES + CAPTIONS + TITLE ----------
+  if (screen === "sbArrange" && sbSourceTrip) {
+    const byId = new Map(sbSourceTrip.photos.map((p) => [p.id, p]));
+    return (
+      <View style={styles.screen}>
+        <SubHeader
+          title="Arrange the Story"
+          subtitle={
+            sbDraftPages.length + " page" + (sbDraftPages.length === 1 ? "" : "s")
+          }
+          onBack={() => setScreen("sbPickPhotos")}
+          backLabel="Photos"
+        />
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+        >
+          <FlatList
+            key="sb-arrange-list"
+            data={sbDraftPages}
+            keyExtractor={(pg) => pg.photoId}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.sbArrangeBody}
+            ListHeaderComponent={
+              <>
+                <Text style={styles.fieldLabel}>Storyboard title</Text>
+                <TextInput
+                  style={styles.fieldInput}
+                  placeholder="e.g. Our Croatia Road Trip"
+                  placeholderTextColor={Atlas.color.outline}
+                  value={sbTitle}
+                  onChangeText={setSbTitle}
+                />
+                <Text style={[styles.fieldLabel, { marginTop: Atlas.space.stackLg }]}>
+                  Pages — reorder & recount each moment
+                </Text>
+              </>
+            }
+            renderItem={({ item, index }) => {
+              const photo = byId.get(item.photoId);
+              if (!photo) return null;
+              return (
+                <View style={styles.sbPageRow}>
+                  <Text style={styles.sbPageNum}>{index + 1}</Text>
+                  <Image source={{ uri: photo.uri }} style={styles.sbPageThumb} />
+                  <TextInput
+                    style={styles.sbCaptionInput}
+                    placeholder="Tell this moment..."
+                    placeholderTextColor={Atlas.color.outline}
+                    value={item.caption}
+                    onChangeText={(t) => setDraftCaption(index, t)}
+                    multiline
+                  />
+                  <View style={styles.sbPageBtns}>
+                    <TouchableOpacity
+                      style={[styles.sbPageBtn, index === 0 && { opacity: 0.25 }]}
+                      disabled={index === 0}
+                      onPress={() => moveDraftPage(index, -1)}
+                    >
+                      <MaterialIcons
+                        name="keyboard-arrow-up"
+                        size={22}
+                        color={Atlas.color.primary}
+                      />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.sbPageBtn}
+                      onPress={() => removeDraftPage(index)}
+                    >
+                      <MaterialIcons
+                        name="close"
+                        size={16}
+                        color={Atlas.color.error}
+                      />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.sbPageBtn,
+                        index === sbDraftPages.length - 1 && { opacity: 0.25 },
+                      ]}
+                      disabled={index === sbDraftPages.length - 1}
+                      onPress={() => moveDraftPage(index, 1)}
+                    >
+                      <MaterialIcons
+                        name="keyboard-arrow-down"
+                        size={22}
+                        color={Atlas.color.primary}
+                      />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            }}
+            ListFooterComponent={
+              <TouchableOpacity
+                style={[
+                  styles.primaryBtn,
+                  { marginTop: Atlas.space.stackLg },
+                  sbDraftPages.length === 0 && { opacity: 0.4 },
+                ]}
+                onPress={saveStoryboard}
+                disabled={sbDraftPages.length === 0}
+              >
+                <Text style={styles.primaryBtnText}>Save Storyboard</Text>
+              </TouchableOpacity>
+            }
+          />
+        </KeyboardAvoidingView>
+      </View>
+    );
+  }
+
+  // ---------- STORYBOARD PLAYBACK (manual page-flip) ----------
+  if (screen === "sbViewer" && activeStory) {
+    const pages = resolveStoryPages(activeStory, trips);
+    const closeStory = () => {
+      setActiveStory(null);
+      setScreen("storybook");
+    };
+
+    if (pages.length === 0) {
+      return (
+        <View style={styles.screen}>
+          <SubHeader
+            title={activeStory.title}
+            onBack={closeStory}
+            backLabel="Stories"
+          />
+          <View style={styles.center}>
+            <MaterialIcons name="auto-stories" size={36} color={Atlas.color.outline} />
+            <Text style={styles.emptyText}>
+              The photos for this storyboard are no longer in its source album.
+            </Text>
+          </View>
+        </View>
+      );
+    }
+
+    const idx = Math.min(storyPageIdx, pages.length - 1);
+    const page = pages[idx];
+    const goNext = () =>
+      setStoryPageIdx((i) => Math.min(i + 1, pages.length - 1));
+    const goPrev = () => setStoryPageIdx((i) => Math.max(i - 1, 0));
+
+    const flingNext = Gesture.Fling()
+      .direction(Directions.LEFT)
+      .onStart(() => runOnJS(goNext)());
+    const flingPrev = Gesture.Fling()
+      .direction(Directions.RIGHT)
+      .onStart(() => runOnJS(goPrev)());
+
+    return (
+      <View style={styles.screen}>
+        {/* Progress segments + title + close */}
+        <View style={styles.sbvTop}>
+          <View style={styles.sbvProgressRow}>
+            {pages.map((pg, i) => (
+              <View
+                key={pg.photo.id}
+                style={[styles.sbvSeg, i <= idx && styles.sbvSegDone]}
+              />
+            ))}
+          </View>
+          <View style={styles.sbvTitleRow}>
+            <Text style={styles.sbvTitle} numberOfLines={1}>
+              {activeStory.title}
+            </Text>
+            <TouchableOpacity
+              onPress={closeStory}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            >
+              <MaterialIcons name="close" size={24} color={Atlas.color.onSurfaceVariant} />
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <GestureDetector gesture={Gesture.Race(flingNext, flingPrev)}>
+          <View style={styles.sbvStage}>
+            <Animated.View
+              key={`story-page-${idx}`}
+              style={styles.sbvPage}
+              entering={storyPageEnter}
+              exiting={FadeOut.duration(300)}
+            >
+              <View style={[styles.storyPhotoFrame, styles.sbvFrame]}>
+                <View style={styles.photoTape} />
+                <Image
+                  source={{ uri: page.photo.uri }}
+                  style={styles.storyPhoto}
+                  resizeMode="cover"
+                />
+                {page.photo.date && (
+                  <Text style={styles.sbvDateLine}>
+                    {fmtStamp(page.photo.date)}
+                  </Text>
+                )}
+              </View>
+              {page.caption.trim() !== "" && (
+                <Animated.View
+                  entering={FadeInUp.delay(420).duration(550)}
+                  style={styles.sbvCaptionWrap}
+                >
+                  <Text style={styles.sbvCaption}>{page.caption.trim()}</Text>
+                </Animated.View>
+              )}
+            </Animated.View>
+
+            {/* Manual paging only: left third = back, right two-thirds = forward */}
+            <TouchableOpacity
+              style={styles.sbvZoneLeft}
+              onPress={goPrev}
+              activeOpacity={1}
+            />
+            <TouchableOpacity
+              style={styles.sbvZoneRight}
+              onPress={goNext}
+              activeOpacity={1}
+            />
+          </View>
+        </GestureDetector>
+
+        <View style={styles.sbvFooter}>
+          <Text style={styles.sbvCount}>
+            {idx + 1} / {pages.length}
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
+  // ---------- STORYBOOK: CURATED STORYBOARD LIST ----------
   if (screen === "storybook") {
-    const storyCandidates = trips.filter((t) => t.photos.length > 0);
-    const storyTrip =
-      storyCandidates.find((t) => t.id === storyTripId) ?? storyCandidates[0] ?? null;
-    const pages = storyTrip ? groupPhotosByDay(storyTrip.photos) : [];
-    const dayIdx = Math.min(storyDay, Math.max(pages.length - 1, 0));
-    const page = pages[dayIdx];
-    const chapterNum =
-      storyTrip ? storyCandidates.findIndex((t) => t.id === storyTrip.id) + 1 : 1;
-    const featured = page?.photos[0];
-    const notes = page ? page.photos.filter((p) => p.caption.trim()) : [];
-    const stops = storyTrip ? clusterIntoStops(storyTrip.photos) : [];
+    const storyGridData: (Storyboard | { id: "__new__" })[] = [
+      ...storyboards,
+      { id: "__new__" },
+    ];
 
     return (
       <View style={styles.screen}>
         <TopAppBar />
-        {!storyTrip ? (
-          <View style={styles.center}>
-            <MaterialIcons name="auto-stories" size={36} color={Atlas.color.outline} />
-            <Text style={styles.emptyText}>
-              No journals yet.{"\n"}Create a trip to begin your first chapter.
-            </Text>
-          </View>
-        ) : (
-          <ScrollView contentContainerStyle={styles.storyBody}>
-            {/* Trip switcher chips */}
-            {storyCandidates.length > 1 && (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={styles.storyChipRow}
+        <FlatList
+          key="storybook-grid"
+          data={storyGridData}
+          keyExtractor={(s) => s.id}
+          numColumns={2}
+          columnWrapperStyle={styles.albumColumns}
+          contentContainerStyle={styles.albumsBody}
+          ListHeaderComponent={
+            <View style={styles.albumsHeader}>
+              <Text style={styles.eyebrow}>Stories Told By Hand</Text>
+              <Text style={styles.albumsTitle} numberOfLines={1}>
+                Storybook
+              </Text>
+              {storyboards.length > 0 ? (
+                <Text style={styles.albumsStats}>
+                  {storyboards.length} storyboard
+                  {storyboards.length === 1 ? "" : "s"}
+                </Text>
+              ) : (
+                <Text style={styles.albumsStats}>
+                  Curate photos from an album into a story you can flip through.
+                </Text>
+              )}
+            </View>
+          }
+          renderItem={({ item, index }) => {
+            if (item.id === "__new__") {
+              return (
+                <TouchableOpacity
+                  style={styles.newJournalCard}
+                  onPress={startCreateStoryboard}
+                  activeOpacity={0.8}
+                >
+                  <View style={styles.newJournalPlus}>
+                    <MaterialIcons name="add" size={22} color={Atlas.color.primary} />
+                  </View>
+                  <Text style={styles.newJournalText}>Create Storyboard</Text>
+                </TouchableOpacity>
+              );
+            }
+            const sb = item as Storyboard;
+            const pages = resolveStoryPages(sb, trips);
+            const cover = pages[0]?.photo;
+            const isEditing = editingStoryId === sb.id;
+            return (
+              <TouchableOpacity
+                style={[
+                  styles.polaroidCard,
+                  { transform: [{ rotate: CARD_ROTATIONS[index % CARD_ROTATIONS.length] }] },
+                ]}
+                activeOpacity={0.85}
+                onPress={() => {
+                  if (isEditing) return;
+                  openStoryViewer(sb);
+                }}
+                onLongPress={() => storyCardMenu(sb)}
               >
-                {storyCandidates.map((t, i) => {
-                  const isActive = t.id === storyTrip.id;
-                  return (
-                    <TouchableOpacity
-                      key={t.id}
-                      style={[
-                        styles.tapedChip,
-                        { transform: [{ rotate: i % 2 === 0 ? "-1deg" : "2deg" }] },
-                        isActive && styles.tapedChipActive,
-                      ]}
-                      onPress={() => {
-                        setStoryTripId(t.id);
-                        setStoryDay(0);
-                      }}
-                    >
-                      <Text
-                        style={[
-                          styles.tapedChipText,
-                          isActive && styles.tapedChipTextActive,
-                        ]}
-                        numberOfLines={1}
-                      >
-                        {t.name}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
-            )}
-
-            {/* Journal page */}
-            <View style={styles.storyPage}>
-              {/* Passport stamp */}
-              {page?.date && (
-                <View style={styles.stamp}>
-                  <View style={styles.stampInner}>
-                    <Text style={styles.stampSmall}>Waypost</Text>
-                    <Text style={styles.stampDate}>{fmtStamp(page.date)}</Text>
-                    <Text style={styles.stampSmall} numberOfLines={1}>
-                      {storyTrip.name}
-                    </Text>
-                  </View>
-                </View>
-              )}
-
-              <Text style={styles.storyEyebrow}>
-                Chapter {toRoman(chapterNum)}: {storyTrip.name}
-              </Text>
-              <Text style={styles.storyTitle}>
-                {page?.date ? `Day ${dayIdx + 1}` : "Undated"}
-              </Text>
-
-              {/* Featured photo, taped in */}
-              {featured && (
-                <View style={styles.storyPhotoFrame}>
-                  <View style={styles.photoTape} />
-                  <TouchableOpacity
-                    activeOpacity={0.9}
-                    onPress={() => {
-                      setActiveTrip(storyTrip);
-                      openViewer(
-                        storyTrip.photos,
-                        storyTrip.photos.findIndex((p) => p.id === featured.id),
-                        true
-                      );
-                    }}
-                  >
-                    <Image source={{ uri: featured.uri }} style={styles.storyPhoto} />
-                  </TouchableOpacity>
-                  <Text style={styles.storyPhotoCaption} numberOfLines={2}>
-                    {featured.caption.trim() ||
-                      (page?.date
-                        ? `${fmtDay(page.date)}, ${storyTrip.name}`
-                        : storyTrip.name)}
-                  </Text>
-                </View>
-              )}
-
-              {/* Journal entries */}
-              <View style={styles.storyEntries}>
-                {notes.length > 0 ? (
-                  notes.map((p) => (
-                    <Text key={p.id} style={styles.journalText}>
-                      {p.caption.trim()}
-                    </Text>
-                  ))
-                ) : (
-                  <Text style={styles.journalTextMuted}>
-                    No notes written for this day yet. Open a photo and add a
-                    caption to fill this page.
-                  </Text>
-                )}
-              </View>
-
-              {/* Day photo strip */}
-              {page && page.photos.length > 1 && (
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={styles.storyStrip}
-                >
-                  {page.photos.map((p, i) => (
-                    <TouchableOpacity
-                      key={p.id}
-                      style={[
-                        styles.storyStripFrame,
-                        { transform: [{ rotate: i % 2 === 0 ? "2deg" : "-2deg" }] },
-                      ]}
-                      onPress={() => {
-                        setActiveTrip(storyTrip);
-                        openViewer(
-                          storyTrip.photos,
-                          storyTrip.photos.findIndex((x) => x.id === p.id),
-                          true
-                        );
-                      }}
-                    >
-                      <Image source={{ uri: p.uri }} style={styles.storyStripPhoto} />
-                    </TouchableOpacity>
-                  ))}
-                </ScrollView>
-              )}
-
-              {/* Prev / next footer */}
-              <View style={styles.storyFooter}>
-                <TouchableOpacity
-                  style={[styles.storyNavBtn, dayIdx === 0 && { opacity: 0.3 }]}
-                  disabled={dayIdx === 0}
-                  onPress={() => setStoryDay(dayIdx - 1)}
-                >
-                  <MaterialIcons
-                    name="arrow-back"
-                    size={16}
-                    color={Atlas.color.onSurfaceVariant}
-                  />
-                  <Text style={styles.storyNavText}>Previous Day</Text>
-                </TouchableOpacity>
-                {pages.length <= 8 ? (
-                  <View style={styles.storyDots}>
-                    {pages.map((pg, i) => (
-                      <View
-                        key={pg.key}
-                        style={[
-                          styles.storyDot,
-                          i === dayIdx && styles.storyDotActive,
-                        ]}
+                <View style={styles.polaroidPhotoWrap}>
+                  {cover ? (
+                    <Image source={{ uri: cover.uri }} style={styles.polaroidPhoto} />
+                  ) : (
+                    <View style={[styles.polaroidPhoto, styles.polaroidPhotoEmpty]}>
+                      <MaterialIcons
+                        name="auto-stories"
+                        size={28}
+                        color={Atlas.color.outlineVariant}
                       />
-                    ))}
-                  </View>
-                ) : (
-                  <Text style={styles.storyNavText}>
-                    {dayIdx + 1} / {pages.length}
+                    </View>
+                  )}
+                </View>
+                <View style={styles.polaroidMeta}>
+                  {isEditing ? (
+                    <TextInput
+                      style={styles.polaroidTitleInput}
+                      value={editingStoryName}
+                      onChangeText={setEditingStoryName}
+                      autoFocus
+                      returnKeyType="done"
+                      onSubmitEditing={confirmEditStory}
+                      onBlur={confirmEditStory}
+                    />
+                  ) : (
+                    <Text style={styles.polaroidTitle} numberOfLines={2}>
+                      {sb.title}
+                    </Text>
+                  )}
+                  <Text style={styles.polaroidSub}>
+                    {pages.length} page{pages.length === 1 ? "" : "s"}
                   </Text>
-                )}
-                <TouchableOpacity
-                  style={[
-                    styles.storyNavBtn,
-                    dayIdx >= pages.length - 1 && { opacity: 0.3 },
-                  ]}
-                  disabled={dayIdx >= pages.length - 1}
-                  onPress={() => setStoryDay(dayIdx + 1)}
-                >
-                  <Text style={styles.storyNavText}>Next Day</Text>
-                  <MaterialIcons
-                    name="arrow-forward"
-                    size={16}
-                    color={Atlas.color.onSurfaceVariant}
-                  />
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Travel ephemera */}
-            <View style={styles.ephemeraCard}>
-              <MaterialIcons name="photo-camera" size={28} color={Atlas.color.secondary} />
-              <View style={{ flex: 1 }}>
-                <Text style={styles.ephemeraTitle}>Memories</Text>
-                <Text style={styles.ephemeraValue}>
-                  {storyTrip.photos.length} photo
-                  {storyTrip.photos.length === 1 ? "" : "s"} archived on this trip
-                </Text>
-              </View>
-            </View>
-            <View style={styles.ephemeraCard}>
-              <MaterialIcons name="place" size={28} color={Atlas.color.secondary} />
-              <View style={{ flex: 1 }}>
-                <Text style={styles.ephemeraTitle}>Journey</Text>
-                <Text style={styles.ephemeraValue}>
-                  {stops.length > 0
-                    ? `${stops.length} stop${stops.length === 1 ? "" : "s"} pinned on the map`
-                    : "No location data on this trip"}
-                </Text>
-              </View>
-            </View>
-          </ScrollView>
-        )}
+                </View>
+              </TouchableOpacity>
+            );
+          }}
+        />
         <BottomNav active="storybook" onNavigate={goTab} />
       </View>
     );
@@ -1551,7 +1966,7 @@ export default function HomeScreen() {
             {albumTrips.length > 0 && (
               <Text style={styles.albumsStats}>
                 {albumTrips.length} trip{albumTrips.length === 1 ? "" : "s"}
-                {" · "}
+                {" Â· "}
                 {albumTrips.reduce((n, t) => n + t.photos.length, 0)} memories
               </Text>
             )}
@@ -1975,81 +2390,6 @@ const styles = StyleSheet.create({
     color: C.primary,
   },
   // ---- Storybook ----
-  storyBody: {
-    paddingHorizontal: S.marginMobile,
-    paddingTop: S.stackMd,
-    paddingBottom: 150,
-  },
-  storyChipRow: { gap: 12, paddingBottom: S.stackMd, paddingHorizontal: 2 },
-  storyPage: {
-    backgroundColor: "rgba(255,255,255,0.55)",
-    borderWidth: 1,
-    borderColor: C.borderFaint,
-    borderRadius: R.sm,
-    padding: S.gutter,
-    shadowColor: "#000",
-    shadowOpacity: 0.05,
-    shadowRadius: 2,
-    shadowOffset: { width: 0, height: 1 },
-    elevation: 1,
-  },
-  stamp: {
-    position: "absolute",
-    top: 12,
-    right: 12,
-    width: 108,
-    height: 108,
-    borderRadius: R.full,
-    borderWidth: 2,
-    borderColor: "rgba(186,26,26,0.4)",
-    alignItems: "center",
-    justifyContent: "center",
-    transform: [{ rotate: "-12deg" }],
-    zIndex: 10,
-    opacity: 0.8,
-  },
-  stampInner: {
-    width: 96,
-    height: 96,
-    borderRadius: R.full,
-    borderWidth: 1,
-    borderColor: "rgba(186,26,26,0.4)",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 6,
-  },
-  stampSmall: {
-    fontFamily: F.mono,
-    fontSize: 8,
-    letterSpacing: 1.6,
-    textTransform: "uppercase",
-    color: "rgba(186,26,26,0.6)",
-    textAlign: "center",
-  },
-  stampDate: {
-    fontFamily: F.monoBold,
-    fontSize: 13,
-    color: "rgba(186,26,26,0.6)",
-    marginVertical: 2,
-    textAlign: "center",
-  },
-  storyEyebrow: {
-    ...T.labelMd,
-    color: C.onSurfaceVariant,
-    textTransform: "uppercase",
-    letterSpacing: 2,
-    marginBottom: S.unit,
-    paddingRight: 110,
-  },
-  storyTitle: {
-    fontFamily: F.sansBoldItalic,
-    fontSize: 42,
-    lineHeight: 46,
-    letterSpacing: -0.8,
-    color: C.primary,
-    marginBottom: S.stackMd,
-    paddingRight: 100,
-  },
   storyPhotoFrame: {
     backgroundColor: C.surfaceContainerLowest,
     borderWidth: 1,
@@ -2081,74 +2421,64 @@ const styles = StyleSheet.create({
     aspectRatio: 4 / 5,
     backgroundColor: C.surfaceContainer,
   },
-  storyPhotoCaption: {
-    fontFamily: F.monoItalic,
-    fontSize: 13,
-    lineHeight: 18,
-    color: C.onSurfaceVariant,
-    textAlign: "center",
-    paddingTop: 12,
-    paddingBottom: 4,
+  // ---- Storyboard playback viewer ----
+  sbvTop: {
+    paddingTop: 58,
+    paddingHorizontal: S.marginMobile,
+    backgroundColor: C.background,
   },
-  storyEntries: { gap: 16, marginBottom: S.stackMd },
-  journalText: { ...T.journalEntry, color: C.onSurface },
-  journalTextMuted: {
-    ...T.journalEntry,
-    fontSize: 15,
-    lineHeight: 25,
-    color: C.onSurfaceVariant,
-  },
-  storyStrip: { gap: 12, paddingVertical: 4, marginBottom: S.stackSm },
-  storyStripFrame: {
-    backgroundColor: C.surfaceContainerLowest,
-    borderWidth: 1,
-    borderColor: C.borderThin,
-    padding: 5,
-  },
-  storyStripPhoto: { width: 84, height: 84, backgroundColor: C.surfaceContainer },
-  storyFooter: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    borderTopWidth: 1,
-    borderTopColor: C.borderFaint,
-    paddingTop: S.stackMd,
-    marginTop: S.stackSm,
-  },
-  storyNavBtn: { flexDirection: "row", alignItems: "center", gap: 6 },
-  storyNavText: { ...T.labelMd, color: C.onSurfaceVariant },
-  storyDots: { flexDirection: "row", gap: 8 },
-  storyDot: {
-    width: 8,
-    height: 8,
+  sbvProgressRow: { flexDirection: "row", gap: 4 },
+  sbvSeg: {
+    flex: 1,
+    height: 3,
     borderRadius: R.full,
     backgroundColor: C.surfaceContainerHighest,
   },
-  storyDotActive: { backgroundColor: C.primaryContainer },
-  ephemeraCard: {
+  sbvSegDone: { backgroundColor: C.primary },
+  sbvTitleRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 16,
-    backgroundColor: C.surfaceContainerLow,
-    borderWidth: 1,
-    borderColor: C.borderFaint,
-    borderRadius: R.sm,
-    padding: S.marginMobile,
-    marginTop: S.gutter,
+    justifyContent: "space-between",
+    gap: 12,
+    paddingVertical: 10,
   },
-  ephemeraTitle: {
-    fontFamily: F.sansSemiBold,
-    fontSize: 12,
-    letterSpacing: 2,
-    textTransform: "uppercase",
-    color: C.primary,
-  },
-  ephemeraValue: {
+  sbvTitle: {
+    flex: 1,
     fontFamily: F.mono,
-    fontSize: 13,
-    lineHeight: 19,
-    color: C.onSurface,
-    marginTop: 2,
+    fontSize: 12,
+    letterSpacing: 1.5,
+    textTransform: "uppercase",
+    color: C.onSurfaceVariant,
+  },
+  sbvStage: { flex: 1 },
+  sbvPage: {
+    ...StyleSheet.absoluteFillObject,
+    paddingHorizontal: S.gutter,
+    paddingTop: S.stackMd,
+  },
+  sbvFrame: {
+    transform: [{ rotate: "1.2deg" }],
+    marginTop: S.stackMd,
+  },
+  sbvDateLine: {
+    fontFamily: F.mono,
+    fontSize: 11,
+    letterSpacing: 1.5,
+    textTransform: "uppercase",
+    color: C.onSurfaceVariant,
+    textAlign: "center",
+    paddingTop: 10,
+  },
+  sbvCaptionWrap: { paddingHorizontal: S.stackSm, paddingTop: S.stackLg },
+  sbvCaption: { ...T.journalEntry, color: C.onSurface, textAlign: "center" },
+  sbvZoneLeft: { position: "absolute", left: 0, top: 0, bottom: 0, width: "33%" },
+  sbvZoneRight: { position: "absolute", right: 0, top: 0, bottom: 0, width: "67%" },
+  sbvFooter: { alignItems: "center", paddingTop: 8, paddingBottom: 34 },
+  sbvCount: {
+    fontFamily: F.monoItalic,
+    fontSize: 12,
+    letterSpacing: 1,
+    color: C.onSurfaceVariant,
   },
 
   // ---- Grids / picker ----
@@ -2160,6 +2490,95 @@ const styles = StyleSheet.create({
     backgroundColor: C.surfaceContainer,
   },
   pickCell: { width: CELL_SIZE, height: CELL_SIZE, position: "relative" },
+  badge: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    backgroundColor: C.primary,
+    width: 26,
+    height: 26,
+    borderRadius: R.full,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    borderColor: C.surfaceContainerLowest,
+  },
+  badgeText: { fontFamily: F.monoBold, color: C.onPrimary, fontSize: 13 },
+
+  // ---- Storyboard create flow ----
+  sbAlbumList: { padding: S.marginMobile, gap: 12 },
+  sbAlbumRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    backgroundColor: C.surfaceContainerLowest,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    borderRadius: R.sm,
+    padding: 12,
+  },
+  sbAlbumThumb: {
+    width: 56,
+    height: 56,
+    borderRadius: R.sm,
+    backgroundColor: C.surfaceContainer,
+  },
+  sbAlbumName: { fontFamily: F.sansSemiBold, fontSize: 16, color: C.primary },
+  sbAlbumCount: {
+    fontFamily: F.monoItalic,
+    fontSize: 12,
+    letterSpacing: 0.6,
+    color: C.onSurfaceVariant,
+    marginTop: 2,
+  },
+  sbArrangeBody: {
+    paddingHorizontal: S.marginMobile,
+    paddingTop: S.stackMd,
+    paddingBottom: 60,
+  },
+  sbPageRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 10,
+    backgroundColor: C.surfaceContainerLowest,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    borderRadius: R.sm,
+    padding: 10,
+    marginBottom: 10,
+  },
+  sbPageNum: {
+    fontFamily: F.monoBold,
+    fontSize: 12,
+    color: C.onSurfaceVariant,
+    width: 18,
+    textAlign: "center",
+    paddingTop: 22,
+  },
+  sbPageThumb: {
+    width: 64,
+    height: 64,
+    borderRadius: R.sm,
+    backgroundColor: C.surfaceContainer,
+  },
+  sbCaptionInput: {
+    flex: 1,
+    minHeight: 64,
+    fontFamily: F.mono,
+    fontSize: 13,
+    lineHeight: 18,
+    color: C.onSurface,
+    paddingTop: 4,
+    paddingHorizontal: 4,
+    textAlignVertical: "top",
+  },
+  sbPageBtns: { alignItems: "center", gap: 2 },
+  sbPageBtn: {
+    width: 28,
+    height: 24,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   selectCheck: {
     position: "absolute",
     top: 6,
