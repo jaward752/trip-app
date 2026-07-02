@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Waypost",
-    "slug": "waypost",
+    "slug": "trip-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -31,6 +31,12 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Waypost reads photo dates and locations to place your memories on the map."
+        }
+      ],
       [
         "expo-splash-screen",
         {

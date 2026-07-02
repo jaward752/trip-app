@@ -1,5 +1,6 @@
 import { MaterialIcons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as ImagePicker from "expo-image-picker";
 import * as MediaLibrary from "expo-media-library";
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -21,7 +22,6 @@ import MapView, { Marker, Polyline } from "react-native-maps";
 
 import { Atlas } from "@/constants/theme";
 
-const LIBRARY_PAGE_SIZE = 120;
 const SCREEN_W = Dimensions.get("window").width;
 const STOP_RADIUS_KM = 5;
 const STORAGE_KEY = "trips_v1";
@@ -49,7 +49,6 @@ type Photo = {
   lat: number | null;
   lon: number | null;
   caption: string;
-  asset?: MediaLibrary.Asset;
 };
 
 type Destination = "album" | "map" | "both";
@@ -76,6 +75,65 @@ function toNum(v: unknown): number | null {
     return Number.isFinite(n) ? n : null;
   }
   return null;
+}
+
+function exifDate(exif: Record<string, any> | null | undefined): Date | null {
+  const raw = exif?.DateTimeOriginal ?? exif?.DateTime;
+  if (typeof raw !== "string") return null;
+  const m = raw.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return null;
+  const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function exifCoord(
+  exif: Record<string, any> | null | undefined,
+  key: "GPSLatitude" | "GPSLongitude",
+  negativeRef: "S" | "W"
+): number | null {
+  const v = toNum(exif?.[key]);
+  if (v === null) return null;
+  const ref = exif?.[key + "Ref"];
+  return typeof ref === "string" && ref.toUpperCase().startsWith(negativeRef)
+    ? -Math.abs(v)
+    : v;
+}
+
+// Turn native-picker results into Photos. Metadata (GPS, creation date,
+// permanent local URI) comes from the media library via assetId so trips
+// survive relaunches; EXIF from the picked copy is the fallback.
+async function pickedToPhotos(
+  assets: ImagePicker.ImagePickerAsset[]
+): Promise<Photo[]> {
+  const photos: Photo[] = [];
+  for (const a of assets) {
+    let uri = a.uri;
+    let date = exifDate(a.exif);
+    let lat = exifCoord(a.exif, "GPSLatitude", "S");
+    let lon = exifCoord(a.exif, "GPSLongitude", "W");
+    if (a.assetId) {
+      try {
+        const info = await MediaLibrary.getAssetInfoAsync(a.assetId, {
+          shouldDownloadFromNetwork: true,
+        });
+        uri = info.localUri ?? info.uri ?? uri;
+        if (info.creationTime) date = new Date(info.creationTime);
+        lat = toNum(info.location?.latitude) ?? lat;
+        lon = toNum(info.location?.longitude) ?? lon;
+      } catch {
+        // keep the EXIF-derived values and the picker's cached copy
+      }
+    }
+    photos.push({
+      id: a.assetId ?? a.uri,
+      uri,
+      date,
+      lat,
+      lon,
+      caption: "",
+    });
+  }
+  return photos;
 }
 
 function fmtDay(d: Date): string {
@@ -273,7 +331,6 @@ function groupPhotosByDay(photos: Photo[]): { key: string; date: Date | null; ph
 
 type Screen =
   | "albums"
-  | "picker"
   | "details"
   | "album"
   | "globalmap"
@@ -399,13 +456,7 @@ export default function HomeScreen() {
   const [trips, setTrips] = useState<Trip[]>([]);
   const [loadedFromStorage, setLoadedFromStorage] = useState(false);
 
-  const [library, setLibrary] = useState<Photo[]>([]);
-  const [loadingLib, setLoadingLib] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const libCursor = useRef<string | undefined>(undefined);
-  const libHasMore = useRef(true);
-  const loadingMoreLib = useRef(false);
-  const [selected, setSelected] = useState<string[]>([]);
+  const [picked, setPicked] = useState<ImagePicker.ImagePickerAsset[]>([]);
   const [preparing, setPreparing] = useState(false);
 
   const [tripName, setTripName] = useState("");
@@ -423,7 +474,6 @@ export default function HomeScreen() {
   const [selectMode, setSelectMode] = useState(false);
   const [gridSelectedIds, setGridSelectedIds] = useState<Set<string>>(new Set());
   const [viewerDeletable, setViewerDeletable] = useState(false);
-  const [addToTripId, setAddToTripId] = useState<string | null>(null);
 
   const [editingTripId, setEditingTripId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
@@ -445,102 +495,37 @@ export default function HomeScreen() {
     }
   }, [trips, loadedFromStorage]);
 
-  function assetsToPhotos(assets: MediaLibrary.Asset[]): Photo[] {
-    return assets.map((asset) => ({
-      id: asset.id,
-      uri: asset.uri,
-      date: asset.creationTime ? new Date(asset.creationTime) : null,
-      lat: null,
-      lon: null,
-      caption: "",
-      asset,
-    }));
-  }
-
   async function openPicker(addToId?: string) {
-    setSelected([]);
-    setAddToTripId(addToId ?? null);
-    setScreen("picker");
-    setLoadingLib(true);
-    setLibrary([]);
-    libCursor.current = undefined;
-    libHasMore.current = true;
-
+    // Media-library access (not needed by the native picker itself) lets us
+    // read GPS/date metadata for the chosen photos and re-resolve them from
+    // storage on the next launch.
     const perm = await MediaLibrary.requestPermissionsAsync();
     if (!perm.granted) {
-      setLoadingLib(false);
       alert("Photo access is needed.");
-      setAddToTripId(null);
-      setScreen(addToId ? "album" : "albums");
       return;
     }
 
-    const page = await MediaLibrary.getAssetsAsync({
-      mediaType: "photo",
-      first: LIBRARY_PAGE_SIZE,
-      sortBy: [["creationTime", false]],
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      allowsMultipleSelection: true,
+      selectionLimit: 0,
+      quality: 1,
+      exif: true,
     });
-    libCursor.current = page.endCursor;
-    libHasMore.current = page.hasNextPage;
+    if (result.canceled || result.assets.length === 0) return;
 
-    setLibrary(assetsToPhotos(page.assets));
-    setLoadingLib(false);
-  }
-
-  async function loadMoreLibrary() {
-    if (loadingLib || loadingMoreLib.current || !libHasMore.current) return;
-    loadingMoreLib.current = true;
-    setLoadingMore(true);
-    try {
-      const page = await MediaLibrary.getAssetsAsync({
-        mediaType: "photo",
-        first: LIBRARY_PAGE_SIZE,
-        after: libCursor.current,
-        sortBy: [["creationTime", false]],
-      });
-      libCursor.current = page.endCursor;
-      libHasMore.current = page.hasNextPage;
-      setLibrary((prev) => {
-        const seen = new Set(prev.map((p) => p.id));
-        const fresh = assetsToPhotos(page.assets.filter((a) => !seen.has(a.id)));
-        return [...prev, ...fresh];
-      });
-    } catch {
-      // leave the cursor as-is; the next end-reached event retries
-    } finally {
-      loadingMoreLib.current = false;
-      setLoadingMore(false);
+    if (addToId) {
+      await appendPhotosToTrip(addToId, result.assets);
+    } else {
+      setPicked(result.assets);
+      setScreen("details");
     }
-  }
-
-  function toggleSelect(id: string) {
-    setSelected((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
   }
 
   async function saveTrip() {
     setPreparing(true);
 
-    const chosenBase = library.filter((p) => selected.includes(p.id));
-
-    const enriched: Photo[] = [];
-    for (const p of chosenBase) {
-      try {
-        const info = await MediaLibrary.getAssetInfoAsync(p.asset!, {
-          shouldDownloadFromNetwork: true,
-        });
-        enriched.push({
-          ...p,
-          uri: info.localUri ?? p.uri,
-          lat: toNum(info.location?.latitude),
-          lon: toNum(info.location?.longitude),
-          asset: undefined,
-        });
-      } catch {
-        enriched.push({ ...p, asset: undefined });
-      }
-    }
+    const enriched = await pickedToPhotos(picked);
 
     enriched.sort((a, b) => {
       if (!a.date) return 1;
@@ -558,45 +543,23 @@ export default function HomeScreen() {
     setTrips((prev) => [trip, ...prev]);
     setTripName("");
     setDestination("album");
-    setSelected([]);
+    setPicked([]);
     setPreparing(false);
     setScreen("albums");
   }
 
-  async function appendPhotosToTrip() {
-    if (!addToTripId) return;
+  async function appendPhotosToTrip(
+    tripId: string,
+    assets: ImagePicker.ImagePickerAsset[]
+  ) {
+    const targetTrip = trips.find((t) => t.id === tripId);
+    if (!targetTrip) return;
     setPreparing(true);
 
-    const targetTrip = trips.find((t) => t.id === addToTripId);
-    if (!targetTrip) {
-      setPreparing(false);
-      setAddToTripId(null);
-      setScreen("album");
-      return;
-    }
-
     const existingIds = new Set(targetTrip.photos.map((p) => p.id));
-    const chosenBase = library.filter(
-      (p) => selected.includes(p.id) && !existingIds.has(p.id)
+    const enriched = (await pickedToPhotos(assets)).filter(
+      (p) => !existingIds.has(p.id)
     );
-
-    const enriched: Photo[] = [];
-    for (const p of chosenBase) {
-      try {
-        const info = await MediaLibrary.getAssetInfoAsync(p.asset!, {
-          shouldDownloadFromNetwork: true,
-        });
-        enriched.push({
-          ...p,
-          uri: info.localUri ?? p.uri,
-          lat: toNum(info.location?.latitude),
-          lon: toNum(info.location?.longitude),
-          asset: undefined,
-        });
-      } catch {
-        enriched.push({ ...p, asset: undefined });
-      }
-    }
 
     const merged = [...targetTrip.photos, ...enriched].sort((a, b) => {
       if (!a.date) return 1;
@@ -605,13 +568,9 @@ export default function HomeScreen() {
     });
 
     const updatedTrip = { ...targetTrip, photos: merged };
-    setTrips((prev) => prev.map((t) => (t.id === addToTripId ? updatedTrip : t)));
+    setTrips((prev) => prev.map((t) => (t.id === tripId ? updatedTrip : t)));
     setActiveTrip(updatedTrip);
-
-    setSelected([]);
     setPreparing(false);
-    setAddToTripId(null);
-    setScreen("album");
   }
 
   function saveCaptionTo(photoId: string, text: string) {
@@ -1224,9 +1183,20 @@ export default function HomeScreen() {
           <TouchableOpacity
             style={styles.primaryPill}
             onPress={() => openPicker(activeTrip!.id)}
+            disabled={preparing}
           >
-            <MaterialIcons name="add-a-photo" size={18} color={Atlas.color.onPrimary} />
-            <Text style={styles.primaryPillText}>Add Photos</Text>
+            {preparing ? (
+              <ActivityIndicator color={Atlas.color.onPrimary} />
+            ) : (
+              <>
+                <MaterialIcons
+                  name="add-a-photo"
+                  size={18}
+                  color={Atlas.color.onPrimary}
+                />
+                <Text style={styles.primaryPillText}>Add Photos</Text>
+              </>
+            )}
           </TouchableOpacity>
         )}
         {selectMode && (
@@ -1260,8 +1230,11 @@ export default function HomeScreen() {
       <View style={styles.screen}>
         <SubHeader
           title="New Journal"
-          onBack={() => setScreen("picker")}
-          backLabel="Photos"
+          onBack={() => {
+            setPicked([]);
+            setScreen("albums");
+          }}
+          backLabel="Albums"
         />
         <ScrollView contentContainerStyle={styles.detailsBody}>
           <Text style={styles.fieldLabel}>Trip name</Text>
@@ -1300,7 +1273,7 @@ export default function HomeScreen() {
           </View>
 
           <Text style={styles.detailsNote}>
-            {selected.length} photo{selected.length === 1 ? "" : "s"} selected
+            {picked.length} photo{picked.length === 1 ? "" : "s"} selected
           </Text>
 
           <TouchableOpacity
@@ -1315,85 +1288,6 @@ export default function HomeScreen() {
             )}
           </TouchableOpacity>
         </ScrollView>
-      </View>
-    );
-  }
-
-  // ---------- PHOTO PICKER ----------
-  if (screen === "picker") {
-    return (
-      <View style={styles.screen}>
-        <SubHeader
-          title={addToTripId ? "Add Photos" : "Select Photos"}
-          onBack={() => {
-            setAddToTripId(null);
-            setSelected([]);
-            setScreen(addToTripId ? "album" : "albums");
-          }}
-          backLabel={addToTripId ? "Album" : "Albums"}
-        />
-        {loadingLib ? (
-          <View style={styles.center}>
-            <ActivityIndicator size="large" color={Atlas.color.primary} />
-            <Text style={styles.emptyText}>Loading your photos...</Text>
-          </View>
-        ) : (
-          <>
-            <FlatList
-              key="picker-grid"
-              data={library}
-              keyExtractor={(p) => p.id}
-              numColumns={GRID_COLS}
-              columnWrapperStyle={styles.gridRow}
-              contentContainerStyle={{ padding: GRID_PADDING, paddingBottom: 110 }}
-              onEndReached={loadMoreLibrary}
-              onEndReachedThreshold={1}
-              ListFooterComponent={
-                loadingMore ? (
-                  <ActivityIndicator
-                    color={Atlas.color.primary}
-                    style={{ paddingVertical: 20 }}
-                  />
-                ) : null
-              }
-              renderItem={({ item }) => {
-                const idx = selected.indexOf(item.id);
-                const isSel = idx !== -1;
-                return (
-                  <TouchableOpacity
-                    style={styles.pickCell}
-                    onPress={() => toggleSelect(item.id)}
-                    activeOpacity={0.8}
-                  >
-                    <Image source={{ uri: item.uri }} style={styles.gridThumb} />
-                    {isSel && (
-                      <View style={styles.badge}>
-                        <Text style={styles.badgeText}>{idx + 1}</Text>
-                      </View>
-                    )}
-                  </TouchableOpacity>
-                );
-              }}
-            />
-            {selected.length > 0 && (
-              <TouchableOpacity
-                style={styles.primaryPill}
-                onPress={addToTripId ? appendPhotosToTrip : () => setScreen("details")}
-                disabled={preparing}
-              >
-                {preparing && addToTripId ? (
-                  <ActivityIndicator color={Atlas.color.onPrimary} />
-                ) : (
-                  <Text style={styles.primaryPillText}>
-                    {addToTripId
-                      ? `Add  (${selected.length})`
-                      : `Next  (${selected.length})`}
-                  </Text>
-                )}
-              </TouchableOpacity>
-            )}
-          </>
-        )}
       </View>
     );
   }
@@ -2266,20 +2160,6 @@ const styles = StyleSheet.create({
     backgroundColor: C.surfaceContainer,
   },
   pickCell: { width: CELL_SIZE, height: CELL_SIZE, position: "relative" },
-  badge: {
-    position: "absolute",
-    top: 6,
-    right: 6,
-    backgroundColor: C.primary,
-    width: 26,
-    height: 26,
-    borderRadius: R.full,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 2,
-    borderColor: C.surfaceContainerLowest,
-  },
-  badgeText: { fontFamily: F.monoBold, color: C.onPrimary, fontSize: 13 },
   selectCheck: {
     position: "absolute",
     top: 6,
