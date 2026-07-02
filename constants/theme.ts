@@ -1,53 +1,166 @@
 /**
- * Below are the colors that are used in the app. The colors are defined in the light and dark mode.
- * There are many other ways to style your app. For example, [Nativewind](https://www.nativewind.dev/), [Tamagui](https://tamagui.dev/), [unistyles](https://reactnativeunistyles.vercel.app), etc.
+ * Design tokens for "Atlas of Life" — sourced verbatim from the Stitch
+ * project (projects/15133168248295068323) design system. Do not tweak
+ * values here by eye; the Stitch design MD is the source of truth.
  */
 
 import { Platform } from 'react-native';
 
-const tintColorLight = '#0a7ea4';
-const tintColorDark = '#fff';
+// ---------- COLORS (Stitch namedColors) ----------
+export const Atlas = {
+  color: {
+    surface: '#fdf8f8',
+    surfaceDim: '#ddd9d8',
+    surfaceBright: '#fdf8f8',
+    surfaceContainerLowest: '#ffffff',
+    surfaceContainerLow: '#f7f3f2',
+    surfaceContainer: '#f1edec',
+    surfaceContainerHigh: '#ebe7e6',
+    surfaceContainerHighest: '#e5e2e1',
+    onSurface: '#1c1b1b',
+    onSurfaceVariant: '#444748',
+    inverseSurface: '#313030',
+    inverseOnSurface: '#f4f0ef',
+    outline: '#747878',
+    outlineVariant: '#c4c7c7',
+    primary: '#000000',
+    onPrimary: '#ffffff',
+    primaryContainer: '#1c1b1b',
+    onPrimaryContainer: '#858383',
+    secondary: '#625e55',
+    onSecondary: '#ffffff',
+    secondaryContainer: '#e8e2d6',
+    onSecondaryContainer: '#68645b',
+    tertiary: '#000000',
+    onTertiary: '#ffffff',
+    tertiaryContainer: '#001f29',
+    onTertiaryContainer: '#668999',
+    error: '#ba1a1a',
+    onError: '#ffffff',
+    errorContainer: '#ffdad6',
+    onErrorContainer: '#93000a',
+    background: '#fdf8f8',
+    onBackground: '#1c1b1b',
+    surfaceVariant: '#e5e2e1',
+    // Accents from the design MD ("Muted Polaroid")
+    accentTeal: '#4a6d7c',
+    // Common alpha borders used throughout the Stitch screens
+    borderFaint: 'rgba(0,0,0,0.05)', // border-primary/5
+    borderThin: 'rgba(0,0,0,0.10)', // border-primary/10
+    borderDashed: 'rgba(0,0,0,0.20)', // border-primary/20
+  },
+
+  // ---------- SPACING (Stitch spacing tokens) ----------
+  space: {
+    unit: 4,
+    stackSm: 8,
+    marginMobile: 20,
+    gutter: 24,
+    stackMd: 24,
+    stackLg: 48,
+    marginDesktop: 64,
+  },
+
+  // ---------- SHAPE (Stitch rounded scale) ----------
+  radius: {
+    sm: 2,
+    default: 4,
+    md: 6,
+    lg: 8,
+    xl: 12,
+    full: 9999,
+  },
+
+  // ---------- TYPOGRAPHY (Stitch type scale) ----------
+  // fontFamily strings match the keys registered with useFonts in app/_layout.tsx
+  type: {
+    displayLg: {
+      fontFamily: 'HankenGrotesk_700Bold',
+      fontSize: 48,
+      lineHeight: 48 * 1.1,
+      letterSpacing: 48 * -0.02,
+    },
+    headlineLg: {
+      fontFamily: 'HankenGrotesk_600SemiBold',
+      fontSize: 32,
+      lineHeight: 32 * 1.2,
+    },
+    headlineLgMobile: {
+      fontFamily: 'HankenGrotesk_600SemiBold',
+      fontSize: 24,
+      lineHeight: 24 * 1.2,
+    },
+    bodyMd: {
+      fontFamily: 'HankenGrotesk_400Regular',
+      fontSize: 16,
+      lineHeight: 16 * 1.6,
+    },
+    labelMd: {
+      fontFamily: 'CourierPrime_400Regular',
+      fontSize: 14,
+      lineHeight: 14 * 1.4,
+      letterSpacing: 14 * 0.05,
+    },
+    journalEntry: {
+      fontFamily: 'CourierPrime_400Regular',
+      fontSize: 18,
+      lineHeight: 18 * 1.7,
+    },
+  },
+
+  font: {
+    sans: 'HankenGrotesk_400Regular',
+    sansSemiBold: 'HankenGrotesk_600SemiBold',
+    sansSemiBoldItalic: 'HankenGrotesk_600SemiBold_Italic',
+    sansBold: 'HankenGrotesk_700Bold',
+    sansBoldItalic: 'HankenGrotesk_700Bold_Italic',
+    sansExtraBold: 'HankenGrotesk_800ExtraBold',
+    mono: 'CourierPrime_400Regular',
+    monoItalic: 'CourierPrime_400Regular_Italic',
+    monoBold: 'CourierPrime_700Bold',
+  },
+} as const;
+
+// ---------- Template compatibility exports ----------
+
+const tintColorLight = Atlas.color.primary;
 
 export const Colors = {
   light: {
-    text: '#11181C',
-    background: '#fff',
+    text: Atlas.color.onSurface,
+    background: Atlas.color.background,
     tint: tintColorLight,
-    icon: '#687076',
-    tabIconDefault: '#687076',
+    icon: Atlas.color.onSurfaceVariant,
+    tabIconDefault: Atlas.color.onSurfaceVariant,
     tabIconSelected: tintColorLight,
   },
   dark: {
-    text: '#ECEDEE',
-    background: '#151718',
-    tint: tintColorDark,
-    icon: '#9BA1A6',
-    tabIconDefault: '#9BA1A6',
-    tabIconSelected: tintColorDark,
+    text: Atlas.color.onSurface,
+    background: Atlas.color.background,
+    tint: tintColorLight,
+    icon: Atlas.color.onSurfaceVariant,
+    tabIconDefault: Atlas.color.onSurfaceVariant,
+    tabIconSelected: tintColorLight,
   },
 };
 
 export const Fonts = Platform.select({
   ios: {
-    /** iOS `UIFontDescriptorSystemDesignDefault` */
-    sans: 'system-ui',
-    /** iOS `UIFontDescriptorSystemDesignSerif` */
+    sans: 'HankenGrotesk_400Regular',
     serif: 'ui-serif',
-    /** iOS `UIFontDescriptorSystemDesignRounded` */
     rounded: 'ui-rounded',
-    /** iOS `UIFontDescriptorSystemDesignMonospaced` */
-    mono: 'ui-monospace',
+    mono: 'CourierPrime_400Regular',
   },
   default: {
-    sans: 'normal',
+    sans: 'HankenGrotesk_400Regular',
     serif: 'serif',
-    rounded: 'normal',
-    mono: 'monospace',
+    rounded: 'HankenGrotesk_400Regular',
+    mono: 'CourierPrime_400Regular',
   },
   web: {
-    sans: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+    sans: "'Hanken Grotesk', system-ui, sans-serif",
     serif: "Georgia, 'Times New Roman', serif",
-    rounded: "'SF Pro Rounded', 'Hiragino Maru Gothic ProN', Meiryo, 'MS PGothic', sans-serif",
-    mono: "SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+    rounded: "'Hanken Grotesk', system-ui, sans-serif",
+    mono: "'Courier Prime', monospace",
   },
 });

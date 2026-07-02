@@ -1,3 +1,4 @@
+import { MaterialIcons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as MediaLibrary from "expo-media-library";
 import React, { useEffect, useRef, useState } from "react";
@@ -8,6 +9,8 @@ import {
   FlatList,
   Image,
   Keyboard,
+  Platform,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -16,10 +19,28 @@ import {
 } from "react-native";
 import MapView, { Marker, Polyline } from "react-native-maps";
 
-const PHOTOS_TO_SHOW = 300;
+import { Atlas } from "@/constants/theme";
+
+const LIBRARY_PAGE_SIZE = 120;
 const SCREEN_W = Dimensions.get("window").width;
 const STOP_RADIUS_KM = 5;
 const STORAGE_KEY = "trips_v1";
+
+// Photo grids: fixed-size cells (fractional flex + aspectRatio misbehaves
+// in FlatList rows on RN 0.81, collapsing rows after the first).
+const GRID_COLS = 4;
+const GRID_GAP = 2;
+const GRID_PADDING = 4;
+const CELL_SIZE =
+  (SCREEN_W - GRID_PADDING * 2 - GRID_GAP * (GRID_COLS - 1)) / GRID_COLS;
+
+// Polaroid rotations from the Stitch Albums screen, in card order.
+const CARD_ROTATIONS = ["-1deg", "2deg", "-0.5deg", "1.5deg", "-2.5deg"];
+
+const MONTHS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 type Photo = {
   id: string;
@@ -55,6 +76,28 @@ function toNum(v: unknown): number | null {
     return Number.isFinite(n) ? n : null;
   }
   return null;
+}
+
+function fmtDay(d: Date): string {
+  return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
+}
+
+function fmtStamp(d: Date): string {
+  return `${d.getDate()} ${MONTHS[d.getMonth()].toUpperCase()} ${d.getFullYear()}`;
+}
+
+function toRoman(n: number): string {
+  const table: [number, string][] = [
+    [10, "X"], [9, "IX"], [5, "V"], [4, "IV"], [1, "I"],
+  ];
+  let out = "";
+  for (const [v, s] of table) {
+    while (n >= v) {
+      out += s;
+      n -= v;
+    }
+  }
+  return out || "I";
 }
 
 // ---------- PERSISTENCE ----------
@@ -209,15 +252,110 @@ function boundsForCoords(
   };
 }
 
+function groupPhotosByDay(photos: Photo[]): { key: string; date: Date | null; photos: Photo[] }[] {
+  const dated = photos
+    .filter((p) => p.date)
+    .sort((a, b) => a.date!.getTime() - b.date!.getTime());
+  const undated = photos.filter((p) => !p.date);
+
+  const pages: { key: string; date: Date | null; photos: Photo[] }[] = [];
+  for (const p of dated) {
+    const key = p.date!.toDateString();
+    const last = pages[pages.length - 1];
+    if (last && last.key === key) last.photos.push(p);
+    else pages.push({ key, date: p.date, photos: [p] });
+  }
+  if (undated.length > 0) {
+    pages.push({ key: "undated", date: null, photos: undated });
+  }
+  return pages;
+}
+
 type Screen =
-  | "home"
   | "albums"
   | "picker"
   | "details"
   | "album"
   | "globalmap"
-  | "tripmap"
-  | "stopgrid";
+  | "stopgrid"
+  | "storybook";
+
+type Tab = "albums" | "globalmap" | "storybook";
+
+// ---------- SHARED CHROME ----------
+
+function TopAppBar() {
+  return (
+    <View style={styles.appBar}>
+      <View style={styles.appBarLeft}>
+        <MaterialIcons name="menu" size={24} color={Atlas.color.primary} />
+        <Text style={styles.appBarTitle}>Waypost</Text>
+      </View>
+      <View style={styles.appBarAvatar}>
+        <MaterialIcons name="person" size={22} color={Atlas.color.onSecondaryContainer} />
+      </View>
+    </View>
+  );
+}
+
+function SubHeader({
+  title,
+  subtitle,
+  onBack,
+  backLabel,
+  rightAction,
+}: {
+  title: string;
+  subtitle?: string;
+  onBack: () => void;
+  backLabel: string;
+  rightAction?: React.ReactNode;
+}) {
+  return (
+    <View style={styles.subHeader}>
+      <TouchableOpacity onPress={onBack} style={styles.subHeaderBack}>
+        <MaterialIcons name="arrow-back" size={18} color={Atlas.color.onSurfaceVariant} />
+        <Text style={styles.subHeaderBackText}>{backLabel}</Text>
+      </TouchableOpacity>
+      <View style={styles.subHeaderMiddle}>
+        <Text style={styles.subHeaderTitle} numberOfLines={1}>
+          {title}
+        </Text>
+        {subtitle ? <Text style={styles.subHeaderSub}>{subtitle}</Text> : null}
+      </View>
+      <View style={styles.subHeaderRight}>{rightAction}</View>
+    </View>
+  );
+}
+
+function BottomNav({ active, onNavigate }: { active: Tab; onNavigate: (t: Tab) => void }) {
+  const items: { tab: Tab; icon: keyof typeof MaterialIcons.glyphMap; label: string }[] = [
+    { tab: "albums", icon: "photo-library", label: "Albums" },
+    { tab: "globalmap", icon: "public", label: "World Map" },
+    { tab: "storybook", icon: "auto-stories", label: "Storybook" },
+  ];
+  return (
+    <View style={styles.bottomNav}>
+      {items.map(({ tab, icon, label }) => {
+        const isActive = tab === active;
+        return (
+          <TouchableOpacity
+            key={tab}
+            style={[styles.navItem, !isActive && { opacity: 0.6 }]}
+            onPress={() => onNavigate(tab)}
+          >
+            <MaterialIcons
+              name={icon}
+              size={24}
+              color={isActive ? Atlas.color.primary : Atlas.color.onSurfaceVariant}
+            />
+            <Text style={[styles.navLabel, isActive && styles.navLabelActive]}>{label}</Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
+}
 
 function ViewerPage({
   photo,
@@ -256,13 +394,17 @@ function ViewerPage({
 }
 
 export default function HomeScreen() {
-  const [screen, setScreen] = useState<Screen>("home");
+  const [screen, setScreen] = useState<Screen>("albums");
 
   const [trips, setTrips] = useState<Trip[]>([]);
   const [loadedFromStorage, setLoadedFromStorage] = useState(false);
 
   const [library, setLibrary] = useState<Photo[]>([]);
   const [loadingLib, setLoadingLib] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const libCursor = useRef<string | undefined>(undefined);
+  const libHasMore = useRef(true);
+  const loadingMoreLib = useRef(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [preparing, setPreparing] = useState(false);
 
@@ -276,7 +418,7 @@ export default function HomeScreen() {
   const [viewerPhotos, setViewerPhotos] = useState<Photo[]>([]);
   const [activeStop, setActiveStop] = useState<Stop | null>(null);
   const [selectedTrip, setSelectedTrip] = useState<Trip | null>(null);
-  const [stopgridReturn, setStopgridReturn] = useState<Screen>("tripmap");
+  const [stopgridReturn, setStopgridReturn] = useState<Screen>("globalmap");
 
   const [selectMode, setSelectMode] = useState(false);
   const [gridSelectedIds, setGridSelectedIds] = useState<Set<string>>(new Set());
@@ -285,6 +427,9 @@ export default function HomeScreen() {
 
   const [editingTripId, setEditingTripId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+
+  const [storyTripId, setStoryTripId] = useState<string | null>(null);
+  const [storyDay, setStoryDay] = useState(0);
 
   useEffect(() => {
     (async () => {
@@ -300,11 +445,26 @@ export default function HomeScreen() {
     }
   }, [trips, loadedFromStorage]);
 
+  function assetsToPhotos(assets: MediaLibrary.Asset[]): Photo[] {
+    return assets.map((asset) => ({
+      id: asset.id,
+      uri: asset.uri,
+      date: asset.creationTime ? new Date(asset.creationTime) : null,
+      lat: null,
+      lon: null,
+      caption: "",
+      asset,
+    }));
+  }
+
   async function openPicker(addToId?: string) {
     setSelected([]);
     setAddToTripId(addToId ?? null);
     setScreen("picker");
     setLoadingLib(true);
+    setLibrary([]);
+    libCursor.current = undefined;
+    libHasMore.current = true;
 
     const perm = await MediaLibrary.requestPermissionsAsync();
     if (!perm.granted) {
@@ -315,33 +475,42 @@ export default function HomeScreen() {
       return;
     }
 
-    const collected: MediaLibrary.Asset[] = [];
-    let after: string | undefined = undefined;
-    let hasNext = true;
-    while (hasNext && collected.length < PHOTOS_TO_SHOW) {
+    const page = await MediaLibrary.getAssetsAsync({
+      mediaType: "photo",
+      first: LIBRARY_PAGE_SIZE,
+      sortBy: [["creationTime", false]],
+    });
+    libCursor.current = page.endCursor;
+    libHasMore.current = page.hasNextPage;
+
+    setLibrary(assetsToPhotos(page.assets));
+    setLoadingLib(false);
+  }
+
+  async function loadMoreLibrary() {
+    if (loadingLib || loadingMoreLib.current || !libHasMore.current) return;
+    loadingMoreLib.current = true;
+    setLoadingMore(true);
+    try {
       const page = await MediaLibrary.getAssetsAsync({
         mediaType: "photo",
-        first: 100,
-        after,
+        first: LIBRARY_PAGE_SIZE,
+        after: libCursor.current,
         sortBy: [["creationTime", false]],
       });
-      collected.push(...page.assets);
-      after = page.endCursor;
-      hasNext = page.hasNextPage;
+      libCursor.current = page.endCursor;
+      libHasMore.current = page.hasNextPage;
+      setLibrary((prev) => {
+        const seen = new Set(prev.map((p) => p.id));
+        const fresh = assetsToPhotos(page.assets.filter((a) => !seen.has(a.id)));
+        return [...prev, ...fresh];
+      });
+    } catch {
+      // leave the cursor as-is; the next end-reached event retries
+    } finally {
+      loadingMoreLib.current = false;
+      setLoadingMore(false);
     }
-
-    const photos: Photo[] = collected.map((asset) => ({
-      id: asset.id,
-      uri: asset.uri,
-      date: asset.creationTime ? new Date(asset.creationTime) : null,
-      lat: null,
-      lon: null,
-      caption: "",
-      asset,
-    }));
-
-    setLibrary(photos);
-    setLoadingLib(false);
   }
 
   function toggleSelect(id: string) {
@@ -479,6 +648,12 @@ export default function HomeScreen() {
     }
   }
 
+  function emptyReturnScreen(): Screen {
+    if (screen === "stopgrid" || screen === "globalmap") return "globalmap";
+    if (screen === "storybook") return "storybook";
+    return "albums";
+  }
+
   function removePhotosFromAlbum(
     tripId: string,
     photoIds: string[],
@@ -496,7 +671,7 @@ export default function HomeScreen() {
       setActiveStop(null);
       setSelectedTrip((prev) => (prev?.id === tripId ? null : prev));
       exitSelectMode();
-      setScreen(emptyReturnTo ?? (screen === "stopgrid" ? "globalmap" : "albums"));
+      setScreen(emptyReturnTo ?? emptyReturnScreen());
     } else {
       setTrips((prev) =>
         prev.map((t) =>
@@ -519,7 +694,7 @@ export default function HomeScreen() {
   function deleteViewerPhoto() {
     if (viewerIndex === null || !activeTrip) return;
     const currentPhoto = viewerPhotos[viewerIndex];
-    const emptyReturnTo: Screen = screen === "stopgrid" ? "globalmap" : "albums";
+    const emptyReturnTo = emptyReturnScreen();
     Alert.alert(
       "Remove from album?",
       "This photo will be removed from the trip but not deleted from your camera roll.",
@@ -560,7 +735,7 @@ export default function HomeScreen() {
   function confirmDeleteSelected() {
     const ids = Array.from(gridSelectedIds);
     if (!activeTrip || ids.length === 0) return;
-    const emptyReturnTo: Screen = screen === "stopgrid" ? "globalmap" : "albums";
+    const emptyReturnTo = emptyReturnScreen();
     Alert.alert(
       `Remove ${ids.length} photo${ids.length === 1 ? "" : "s"}?`,
       "They will be removed from this trip but not deleted from your camera roll.",
@@ -609,6 +784,30 @@ export default function HomeScreen() {
     setEditingName("");
   }
 
+  function albumCardMenu(trip: Trip) {
+    Alert.alert(trip.name, undefined, [
+      { text: "Rename", onPress: () => startEdit(trip) },
+      { text: "Delete", style: "destructive", onPress: () => deleteTrip(trip.id) },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  }
+
+  function goTab(tab: Tab) {
+    exitSelectMode();
+    setScreen(tab);
+  }
+
+  async function zoomMap(delta: number) {
+    const cam = await mapRef.current?.getCamera();
+    if (!cam) return;
+    if (cam.zoom != null && Number.isFinite(cam.zoom)) {
+      cam.zoom += delta;
+    } else if (cam.altitude != null && Number.isFinite(cam.altitude)) {
+      cam.altitude *= delta > 0 ? 0.5 : 2;
+    }
+    mapRef.current?.animateCamera(cam, { duration: 300 });
+  }
+
   const albumTrips = trips.filter(
     (t) => t.destination === "album" || t.destination === "both"
   );
@@ -630,12 +829,12 @@ export default function HomeScreen() {
         </View>
 
         <TouchableOpacity style={styles.viewerClose} onPress={closeViewer}>
-          <Text style={styles.viewerCloseText}>{"✕"}</Text>
+          <MaterialIcons name="close" size={26} color="rgba(255,255,255,0.85)" />
         </TouchableOpacity>
 
         {viewerDeletable && activeTrip && (
           <TouchableOpacity style={styles.viewerTrash} onPress={deleteViewerPhoto}>
-            <Text style={styles.viewerTrashIcon}>{"🗑"}</Text>
+            <MaterialIcons name="delete-outline" size={24} color="rgba(255,255,255,0.85)" />
           </TouchableOpacity>
         )}
 
@@ -664,7 +863,7 @@ export default function HomeScreen() {
     );
   }
 
-  // ---------- GLOBAL MAP ----------
+  // ---------- WORLD MAP ----------
   if (screen === "globalmap") {
     const pinned = mapTrips
       .map((t) => ({ trip: t, centre: tripCentre(t) }))
@@ -674,108 +873,176 @@ export default function HomeScreen() {
     }[];
 
     const selectedStops = selectedTrip ? clusterIntoStops(selectedTrip.photos) : [];
-    const worldRegion = boundsForCoords(pinned.map((p) => p.centre), 0.3, 20);
+    const worldRegion =
+      pinned.length > 0
+        ? boundsForCoords(pinned.map((p) => p.centre), 0.3, 20)
+        : null;
 
     return (
       <View style={styles.screen}>
-        <Header
-          title="Global Map"
-          onBack={() => setScreen("home")}
-          backLabel="Home"
-        />
-        {pinned.length === 0 ? (
-          <View style={styles.center}>
-            <Text style={styles.muted}>
-              No map trips yet. Create a trip and choose Map or Both.
+        <TopAppBar />
+        {/* Header row: breadcrumbs (or back-to-all-trips) + artifact badge */}
+        <View style={styles.mapCrumbRow}>
+          {selectedTrip ? (
+            <TouchableOpacity
+              style={styles.mapBackBtn}
+              onPress={() => {
+                setSelectedTrip(null);
+                if (worldRegion) {
+                  mapRef.current?.animateToRegion(worldRegion, 600);
+                }
+              }}
+            >
+              <MaterialIcons name="arrow-back" size={14} color={Atlas.color.primary} />
+              <Text style={styles.mapBackBtnText}>All Trips</Text>
+            </TouchableOpacity>
+          ) : (
+            <View style={styles.crumbs}>
+              <Text style={styles.crumbMuted}>Albums</Text>
+              <MaterialIcons
+                name="chevron-right"
+                size={16}
+                color={Atlas.color.onSurfaceVariant}
+              />
+              <Text style={styles.crumbActive}>World Map</Text>
+            </View>
+          )}
+          <View style={styles.artifactBadge}>
+            <MaterialIcons name="map" size={14} color={Atlas.color.onSecondaryContainer} />
+            <Text style={styles.artifactBadgeText} numberOfLines={1}>
+              {selectedTrip ? `Route: ${selectedTrip.name}` : "All routes"}
             </Text>
           </View>
-        ) : (
-          <>
-            <MapView
-              ref={mapRef}
-              style={{ flex: 1 }}
-              initialRegion={
-                selectedTrip && selectedStops.length > 0
-                  ? boundsForCoords(selectedStops.map((s) => ({ lat: s.lat, lon: s.lon })))
-                  : worldRegion
-              }
-            >
-              {pinned.map(({ trip, centre }) => {
-                if (selectedTrip && trip.id === selectedTrip.id) return null;
-                return (
-                  <Marker
-                    key={trip.id}
-                    coordinate={{ latitude: centre.lat, longitude: centre.lon }}
+        </View>
+
+          {/* Framed map */}
+          <View style={styles.mapFrame}>
+            {pinned.length === 0 ? (
+              <View style={styles.mapEmpty}>
+                <MaterialIcons name="public" size={36} color={Atlas.color.outline} />
+                <Text style={styles.emptyText}>
+                  No map trips yet.{"\n"}Create a trip and choose Map or Both.
+                </Text>
+              </View>
+            ) : (
+              <>
+                <MapView
+                  ref={mapRef}
+                  style={{ flex: 1 }}
+                  mapType={Platform.OS === "ios" ? "mutedStandard" : "standard"}
+                  initialRegion={
+                    selectedTrip && selectedStops.length > 0
+                      ? boundsForCoords(
+                          selectedStops.map((s) => ({ lat: s.lat, lon: s.lon }))
+                        )
+                      : worldRegion!
+                  }
+                >
+                  {pinned.map(({ trip, centre }) => {
+                    if (selectedTrip && trip.id === selectedTrip.id) return null;
+                    return (
+                      <Marker
+                        key={trip.id}
+                        coordinate={{ latitude: centre.lat, longitude: centre.lon }}
+                        onPress={() => {
+                          const stops = clusterIntoStops(trip.photos);
+                          const coords =
+                            stops.length > 0
+                              ? stops.map((s) => ({ lat: s.lat, lon: s.lon }))
+                              : trip.photos
+                                  .filter((p) => p.lat !== null && p.lon !== null)
+                                  .map((p) => ({ lat: p.lat!, lon: p.lon! }));
+                          setActiveTrip(trip);
+                          setSelectedTrip(trip);
+                          if (coords.length > 0) {
+                            mapRef.current?.animateToRegion(
+                              boundsForCoords(coords),
+                              600
+                            );
+                          }
+                        }}
+                      >
+                        <View style={styles.mapPin}>
+                          <MaterialIcons
+                            name="location-on"
+                            size={34}
+                            color={Atlas.color.error}
+                          />
+                          <Text style={styles.mapPinLabel} numberOfLines={1}>
+                            {trip.name}
+                          </Text>
+                        </View>
+                      </Marker>
+                    );
+                  })}
+
+                  {selectedTrip && selectedStops.length > 0 && (
+                    <>
+                      <Polyline
+                        coordinates={selectedStops.map((s) => ({
+                          latitude: s.lat,
+                          longitude: s.lon,
+                        }))}
+                        strokeColor={Atlas.color.error}
+                        strokeWidth={2}
+                        lineDashPattern={[5, 5]}
+                      />
+                      {selectedStops.map((s, i) => (
+                        <Marker
+                          key={"stop-" + s.id}
+                          coordinate={{ latitude: s.lat, longitude: s.lon }}
+                          title={"Stop " + (i + 1)}
+                          description={
+                            s.photos.length +
+                            " photo" +
+                            (s.photos.length === 1 ? "" : "s") +
+                            " · tap to view"
+                          }
+                          onPress={() => {
+                            setStopgridReturn("globalmap");
+                            setActiveStop(s);
+                            setScreen("stopgrid");
+                          }}
+                        >
+                          <MaterialIcons
+                            name="location-on"
+                            size={30}
+                            color={Atlas.color.error}
+                          />
+                        </Marker>
+                      ))}
+                    </>
+                  )}
+                </MapView>
+
+                {/* Map controls */}
+                <View style={styles.mapControls}>
+                  <TouchableOpacity style={styles.mapCtrlBtn} onPress={() => zoomMap(-1)}>
+                    <MaterialIcons name="remove" size={22} color={Atlas.color.primary} />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.mapCtrlBtn, styles.mapCtrlBtnDark]}
                     onPress={() => {
-                      const stops = clusterIntoStops(trip.photos);
-                      const coords =
-                        stops.length > 0
-                          ? stops.map((s) => ({ lat: s.lat, lon: s.lon }))
-                          : trip.photos
-                              .filter((p) => p.lat !== null && p.lon !== null)
-                              .map((p) => ({ lat: p.lat!, lon: p.lon! }));
-                      setActiveTrip(trip);
-                      setSelectedTrip(trip);
-                      if (coords.length > 0) {
-                        mapRef.current?.animateToRegion(boundsForCoords(coords), 600);
+                      if (selectedTrip && selectedStops.length > 0) {
+                        mapRef.current?.animateToRegion(
+                          boundsForCoords(
+                            selectedStops.map((s) => ({ lat: s.lat, lon: s.lon }))
+                          ),
+                          600
+                        );
+                      } else if (worldRegion) {
+                        mapRef.current?.animateToRegion(worldRegion, 600);
                       }
                     }}
                   >
-                    <View style={styles.mapPin}>
-                      <View style={styles.mapPinDot} />
-                      <Text style={styles.mapPinLabel} numberOfLines={1}>
-                        {trip.name}
-                      </Text>
-                    </View>
-                  </Marker>
-                );
-              })}
+                    <MaterialIcons name="my-location" size={20} color={Atlas.color.onPrimary} />
+                  </TouchableOpacity>
+                </View>
 
-              {selectedTrip && selectedStops.length > 0 && (
-                <>
-                  <Polyline
-                    coordinates={selectedStops.map((s) => ({
-                      latitude: s.lat,
-                      longitude: s.lon,
-                    }))}
-                    strokeColor="#8b3a2f"
-                    strokeWidth={3}
-                  />
-                  {selectedStops.map((s, i) => (
-                    <Marker
-                      key={"stop-" + s.id}
-                      coordinate={{ latitude: s.lat, longitude: s.lon }}
-                      title={"Stop " + (i + 1)}
-                      description={
-                        s.photos.length +
-                        " photo" +
-                        (s.photos.length === 1 ? "" : "s") +
-                        " · tap to view"
-                      }
-                      onPress={() => {
-                        setStopgridReturn("globalmap");
-                        setActiveStop(s);
-                        setScreen("stopgrid");
-                      }}
-                    />
-                  ))}
-                </>
-              )}
-            </MapView>
-
-            {selectedTrip && (
-              <TouchableOpacity
-                style={styles.mapBackBtn}
-                onPress={() => {
-                  setSelectedTrip(null);
-                  mapRef.current?.animateToRegion(worldRegion, 600);
-                }}
-              >
-                <Text style={styles.mapBackBtnText}>{"‹"} All trips</Text>
-              </TouchableOpacity>
+              </>
             )}
-          </>
-        )}
+          </View>
+        <BottomNav active="globalmap" onNavigate={goTab} />
       </View>
     );
   }
@@ -788,11 +1055,9 @@ export default function HomeScreen() {
     const stopIsEmpty = activeStop.photos.length === 0;
     return (
       <View style={styles.screen}>
-        <Header
-          title={
-            "Stop " +
-            (stopIndex > 0 ? stopIndex : "?") +
-            "  ·  " +
+        <SubHeader
+          title={"Stop " + (stopIndex > 0 ? stopIndex : "?")}
+          subtitle={
             activeStop.photos.length +
             " photo" +
             (activeStop.photos.length === 1 ? "" : "s")
@@ -818,15 +1083,19 @@ export default function HomeScreen() {
         />
         {stopIsEmpty ? (
           <View style={styles.center}>
-            <Text style={styles.muted}>No photos in this stop.</Text>
+            <Text style={styles.emptyText}>No photos in this stop.</Text>
           </View>
         ) : (
           <FlatList
             key="stopgrid-grid"
             data={activeStop.photos}
             keyExtractor={(p) => p.id}
-            numColumns={3}
-            contentContainerStyle={{ padding: 4, paddingBottom: selectMode ? 90 : 24 }}
+            numColumns={GRID_COLS}
+            columnWrapperStyle={styles.gridRow}
+            contentContainerStyle={{
+              padding: GRID_PADDING,
+              paddingBottom: selectMode ? 110 : 24,
+            }}
             renderItem={({ item, index }) => {
               const isSelected = gridSelectedIds.has(item.id);
               return (
@@ -842,15 +1111,14 @@ export default function HomeScreen() {
                   activeOpacity={0.85}
                 >
                   <Image source={{ uri: item.uri }} style={styles.gridThumb} />
-                  {selectMode && (
-                    isSelected ? (
+                  {selectMode &&
+                    (isSelected ? (
                       <View style={styles.selectCheck}>
-                        <Text style={styles.selectCheckText}>{"✓"}</Text>
+                        <MaterialIcons name="check" size={15} color={Atlas.color.onPrimary} />
                       </View>
                     ) : (
                       <View style={styles.selectCircle} />
-                    )
-                  )}
+                    ))}
                 </TouchableOpacity>
               );
             }}
@@ -881,79 +1149,18 @@ export default function HomeScreen() {
     );
   }
 
-  // ---------- TRIP MAP ----------
-  if (screen === "tripmap" && activeTrip) {
-    const stops = clusterIntoStops(activeTrip.photos);
-
-    if (stops.length === 0) {
-      return (
-        <View style={styles.screen}>
-          <Header
-            title={activeTrip.name}
-            onBack={() => setScreen("globalmap")}
-            backLabel="Map"
-          />
-          <View style={styles.center}>
-            <Text style={styles.muted}>No location data on this trip.</Text>
-          </View>
-        </View>
-      );
-    }
-
-    return (
-      <View style={styles.screen}>
-        <Header
-          title={activeTrip.name}
-          onBack={() => setScreen("globalmap")}
-          backLabel="Map"
-        />
-        <MapView
-          style={{ flex: 1 }}
-          initialRegion={{
-            latitude: stops[0].lat,
-            longitude: stops[0].lon,
-            latitudeDelta: 0.5,
-            longitudeDelta: 0.5,
-          }}
-        >
-          <Polyline
-            coordinates={stops.map((s) => ({
-              latitude: s.lat,
-              longitude: s.lon,
-            }))}
-            strokeColor="#8b3a2f"
-            strokeWidth={3}
-          />
-          {stops.map((s, i) => (
-            <Marker
-              key={s.id}
-              coordinate={{ latitude: s.lat, longitude: s.lon }}
-              title={"Stop " + (i + 1)}
-              description={
-                s.photos.length +
-                " photo" +
-                (s.photos.length === 1 ? "" : "s") +
-                " · tap to view"
-              }
-              onPress={() => {
-                setStopgridReturn("tripmap");
-                setActiveStop(s);
-                setScreen("stopgrid");
-              }}
-            />
-          ))}
-        </MapView>
-      </View>
-    );
-  }
-
   // ---------- VIEW AN ALBUM (grid) ----------
   if (screen === "album" && activeTrip) {
     const isEmpty = activeTrip.photos.length === 0;
     return (
       <View style={styles.screen}>
-        <Header
+        <SubHeader
           title={activeTrip.name}
+          subtitle={
+            activeTrip.photos.length +
+            " memor" +
+            (activeTrip.photos.length === 1 ? "y" : "ies")
+          }
           onBack={() => {
             exitSelectMode();
             setScreen("albums");
@@ -975,15 +1182,16 @@ export default function HomeScreen() {
         />
         {isEmpty ? (
           <View style={styles.center}>
-            <Text style={styles.muted}>No photos in this album.</Text>
+            <Text style={styles.emptyText}>No photos in this album.</Text>
           </View>
         ) : (
           <FlatList
             key="album-grid"
             data={activeTrip.photos}
             keyExtractor={(p) => p.id}
-            numColumns={3}
-            contentContainerStyle={{ padding: 4, paddingBottom: 90 }}
+            numColumns={GRID_COLS}
+            columnWrapperStyle={styles.gridRow}
+            contentContainerStyle={{ padding: GRID_PADDING, paddingBottom: 110 }}
             renderItem={({ item, index }) => {
               const isSelected = gridSelectedIds.has(item.id);
               return (
@@ -999,15 +1207,14 @@ export default function HomeScreen() {
                   activeOpacity={0.85}
                 >
                   <Image source={{ uri: item.uri }} style={styles.gridThumb} />
-                  {selectMode && (
-                    isSelected ? (
+                  {selectMode &&
+                    (isSelected ? (
                       <View style={styles.selectCheck}>
-                        <Text style={styles.selectCheckText}>{"✓"}</Text>
+                        <MaterialIcons name="check" size={15} color={Atlas.color.onPrimary} />
                       </View>
                     ) : (
                       <View style={styles.selectCircle} />
-                    )
-                  )}
+                    ))}
                 </TouchableOpacity>
               );
             }}
@@ -1015,10 +1222,11 @@ export default function HomeScreen() {
         )}
         {!selectMode && (
           <TouchableOpacity
-            style={styles.floatingBtn}
+            style={styles.primaryPill}
             onPress={() => openPicker(activeTrip!.id)}
           >
-            <Text style={styles.primaryBtnText}>{"+"}{" "}{"  "}Add Photos</Text>
+            <MaterialIcons name="add-a-photo" size={18} color={Atlas.color.onPrimary} />
+            <Text style={styles.primaryPillText}>Add Photos</Text>
           </TouchableOpacity>
         )}
         {selectMode && (
@@ -1050,59 +1258,63 @@ export default function HomeScreen() {
   if (screen === "details") {
     return (
       <View style={styles.screen}>
-        <Header
-          title="New Trip"
+        <SubHeader
+          title="New Journal"
           onBack={() => setScreen("picker")}
           backLabel="Photos"
         />
-        <View style={{ padding: 20 }}>
-          <Text style={styles.label}>Trip name</Text>
+        <ScrollView contentContainerStyle={styles.detailsBody}>
+          <Text style={styles.fieldLabel}>Trip name</Text>
           <TextInput
-            style={styles.input}
+            style={styles.fieldInput}
             placeholder="e.g. Namibia Road Trip"
-            placeholderTextColor="#bbb"
+            placeholderTextColor={Atlas.color.outline}
             value={tripName}
             onChangeText={setTripName}
           />
 
-          <Text style={[styles.label, { marginTop: 24 }]}>Add this to...</Text>
-          {(["album", "map", "both"] as Destination[]).map((d) => (
-            <TouchableOpacity
-              key={d}
-              style={[styles.choice, destination === d && styles.choiceActive]}
-              onPress={() => setDestination(d)}
-            >
-              <Text
-                style={[
-                  styles.choiceText,
-                  destination === d && styles.choiceTextActive,
-                ]}
-              >
-                {d === "album"
-                  ? "📔  Album only"
-                  : d === "map"
-                  ? "🌍  Map only"
-                  : "📔🌍  Both"}
-              </Text>
-            </TouchableOpacity>
-          ))}
+          <Text style={[styles.fieldLabel, { marginTop: Atlas.space.stackLg }]}>
+            Add this to...
+          </Text>
+          <View style={styles.choiceRow}>
+            {(["album", "map", "both"] as Destination[]).map((d, i) => {
+              const isActive = destination === d;
+              return (
+                <TouchableOpacity
+                  key={d}
+                  style={[
+                    styles.tapedChip,
+                    { transform: [{ rotate: ["-1deg", "2deg", "-1deg"][i] }] },
+                    isActive && styles.tapedChipActive,
+                  ]}
+                  onPress={() => setDestination(d)}
+                >
+                  <Text
+                    style={[styles.tapedChipText, isActive && styles.tapedChipTextActive]}
+                  >
+                    {d === "album" ? "#Album" : d === "map" ? "#Map" : "#Both"}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
 
-          <Text style={styles.note}>
+          <Text style={styles.detailsNote}>
             {selected.length} photo{selected.length === 1 ? "" : "s"} selected
           </Text>
 
           <TouchableOpacity
-            style={[styles.primaryBtn, { marginTop: 24 }]}
+            style={[styles.primaryBtn, { marginTop: Atlas.space.stackMd }]}
             onPress={saveTrip}
             disabled={preparing}
           >
             {preparing ? (
-              <ActivityIndicator color="#fff" />
+              <ActivityIndicator color={Atlas.color.onPrimary} />
             ) : (
               <Text style={styles.primaryBtnText}>Save Trip</Text>
             )}
           </TouchableOpacity>
-        </View>
+        </ScrollView>
       </View>
     );
   }
@@ -1111,7 +1323,7 @@ export default function HomeScreen() {
   if (screen === "picker") {
     return (
       <View style={styles.screen}>
-        <Header
+        <SubHeader
           title={addToTripId ? "Add Photos" : "Select Photos"}
           onBack={() => {
             setAddToTripId(null);
@@ -1122,8 +1334,8 @@ export default function HomeScreen() {
         />
         {loadingLib ? (
           <View style={styles.center}>
-            <ActivityIndicator size="large" color="#8b3a2f" />
-            <Text style={styles.muted}>Loading your photos...</Text>
+            <ActivityIndicator size="large" color={Atlas.color.primary} />
+            <Text style={styles.emptyText}>Loading your photos...</Text>
           </View>
         ) : (
           <>
@@ -1131,8 +1343,19 @@ export default function HomeScreen() {
               key="picker-grid"
               data={library}
               keyExtractor={(p) => p.id}
-              numColumns={3}
-              contentContainerStyle={{ padding: 4, paddingBottom: 90 }}
+              numColumns={GRID_COLS}
+              columnWrapperStyle={styles.gridRow}
+              contentContainerStyle={{ padding: GRID_PADDING, paddingBottom: 110 }}
+              onEndReached={loadMoreLibrary}
+              onEndReachedThreshold={1}
+              ListFooterComponent={
+                loadingMore ? (
+                  <ActivityIndicator
+                    color={Atlas.color.primary}
+                    style={{ paddingVertical: 20 }}
+                  />
+                ) : null
+              }
               renderItem={({ item }) => {
                 const idx = selected.indexOf(item.id);
                 const isSel = idx !== -1;
@@ -1154,14 +1377,14 @@ export default function HomeScreen() {
             />
             {selected.length > 0 && (
               <TouchableOpacity
-                style={styles.floatingBtn}
+                style={styles.primaryPill}
                 onPress={addToTripId ? appendPhotosToTrip : () => setScreen("details")}
                 disabled={preparing}
               >
                 {preparing && addToTripId ? (
-                  <ActivityIndicator color="#fff" />
+                  <ActivityIndicator color={Atlas.color.onPrimary} />
                 ) : (
-                  <Text style={styles.primaryBtnText}>
+                  <Text style={styles.primaryPillText}>
                     {addToTripId
                       ? `Add  (${selected.length})`
                       : `Next  (${selected.length})`}
@@ -1175,324 +1398,1027 @@ export default function HomeScreen() {
     );
   }
 
-  // ---------- ALBUMS LIST ----------
-  if (screen === "albums") {
+  // ---------- STORYBOOK ----------
+  if (screen === "storybook") {
+    const storyCandidates = trips.filter((t) => t.photos.length > 0);
+    const storyTrip =
+      storyCandidates.find((t) => t.id === storyTripId) ?? storyCandidates[0] ?? null;
+    const pages = storyTrip ? groupPhotosByDay(storyTrip.photos) : [];
+    const dayIdx = Math.min(storyDay, Math.max(pages.length - 1, 0));
+    const page = pages[dayIdx];
+    const chapterNum =
+      storyTrip ? storyCandidates.findIndex((t) => t.id === storyTrip.id) + 1 : 1;
+    const featured = page?.photos[0];
+    const notes = page ? page.photos.filter((p) => p.caption.trim()) : [];
+    const stops = storyTrip ? clusterIntoStops(storyTrip.photos) : [];
+
     return (
       <View style={styles.screen}>
-        <Header
-          title="Your Albums"
-          onBack={() => setScreen("home")}
-          backLabel="Back"
-        />
-        {albumTrips.length === 0 ? (
+        <TopAppBar />
+        {!storyTrip ? (
           <View style={styles.center}>
-            <Text style={styles.muted}>No albums yet.</Text>
+            <MaterialIcons name="auto-stories" size={36} color={Atlas.color.outline} />
+            <Text style={styles.emptyText}>
+              No journals yet.{"\n"}Create a trip to begin your first chapter.
+            </Text>
           </View>
         ) : (
-          <FlatList
-            key="albums-list"
-            data={albumTrips}
-            keyExtractor={(t) => t.id}
-            contentContainerStyle={{ padding: 12, paddingBottom: 90 }}
-            renderItem={({ item }) => {
-              const isEditing = editingTripId === item.id;
-              return (
-                <TouchableOpacity
-                  style={styles.tripCard}
-                  activeOpacity={0.85}
-                  onPress={() => {
-                    if (isEditing) return;
-                    setActiveTrip(item);
-                    setScreen("album");
-                  }}
-                >
-                  {item.photos[0] && (
-                    <Image
-                      source={{ uri: item.photos[0].uri }}
-                      style={styles.tripCover}
-                    />
-                  )}
-                  <View style={styles.tripMeta}>
-                    {isEditing ? (
-                      <TextInput
-                        style={styles.tripTitleInput}
-                        value={editingName}
-                        onChangeText={setEditingName}
-                        autoFocus
-                        returnKeyType="done"
-                        onSubmitEditing={confirmEdit}
-                        onBlur={confirmEdit}
-                      />
-                    ) : (
-                      <Text style={styles.tripTitle}>{item.name}</Text>
-                    )}
-                    <Text style={styles.tripSub}>
-                      {item.photos.length} photo
-                      {item.photos.length === 1 ? "" : "s"}
-                      {item.destination === "both" ? "  ·  on map too" : ""}
+          <ScrollView contentContainerStyle={styles.storyBody}>
+            {/* Trip switcher chips */}
+            {storyCandidates.length > 1 && (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.storyChipRow}
+              >
+                {storyCandidates.map((t, i) => {
+                  const isActive = t.id === storyTrip.id;
+                  return (
+                    <TouchableOpacity
+                      key={t.id}
+                      style={[
+                        styles.tapedChip,
+                        { transform: [{ rotate: i % 2 === 0 ? "-1deg" : "2deg" }] },
+                        isActive && styles.tapedChipActive,
+                      ]}
+                      onPress={() => {
+                        setStoryTripId(t.id);
+                        setStoryDay(0);
+                      }}
+                    >
+                      <Text
+                        style={[
+                          styles.tapedChipText,
+                          isActive && styles.tapedChipTextActive,
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {t.name}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
+
+            {/* Journal page */}
+            <View style={styles.storyPage}>
+              {/* Passport stamp */}
+              {page?.date && (
+                <View style={styles.stamp}>
+                  <View style={styles.stampInner}>
+                    <Text style={styles.stampSmall}>Waypost</Text>
+                    <Text style={styles.stampDate}>{fmtStamp(page.date)}</Text>
+                    <Text style={styles.stampSmall} numberOfLines={1}>
+                      {storyTrip.name}
                     </Text>
                   </View>
-                  <View style={styles.tripActions}>
-                    {isEditing ? (
-                      <TouchableOpacity style={styles.actionBtn} onPress={confirmEdit}>
-                        <Text style={styles.actionConfirm}>{"✓"}</Text>
-                      </TouchableOpacity>
-                    ) : (
-                      <>
-                        <TouchableOpacity style={styles.actionBtn} onPress={() => startEdit(item)}>
-                          <Text style={styles.actionIcon}>{"✏️"}</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity style={styles.actionBtn} onPress={() => deleteTrip(item.id)}>
-                          <Text style={styles.actionIcon}>{"🗑️"}</Text>
-                        </TouchableOpacity>
-                      </>
-                    )}
-                  </View>
+                </View>
+              )}
+
+              <Text style={styles.storyEyebrow}>
+                Chapter {toRoman(chapterNum)}: {storyTrip.name}
+              </Text>
+              <Text style={styles.storyTitle}>
+                {page?.date ? `Day ${dayIdx + 1}` : "Undated"}
+              </Text>
+
+              {/* Featured photo, taped in */}
+              {featured && (
+                <View style={styles.storyPhotoFrame}>
+                  <View style={styles.photoTape} />
+                  <TouchableOpacity
+                    activeOpacity={0.9}
+                    onPress={() => {
+                      setActiveTrip(storyTrip);
+                      openViewer(
+                        storyTrip.photos,
+                        storyTrip.photos.findIndex((p) => p.id === featured.id),
+                        true
+                      );
+                    }}
+                  >
+                    <Image source={{ uri: featured.uri }} style={styles.storyPhoto} />
+                  </TouchableOpacity>
+                  <Text style={styles.storyPhotoCaption} numberOfLines={2}>
+                    {featured.caption.trim() ||
+                      (page?.date
+                        ? `${fmtDay(page.date)}, ${storyTrip.name}`
+                        : storyTrip.name)}
+                  </Text>
+                </View>
+              )}
+
+              {/* Journal entries */}
+              <View style={styles.storyEntries}>
+                {notes.length > 0 ? (
+                  notes.map((p) => (
+                    <Text key={p.id} style={styles.journalText}>
+                      {p.caption.trim()}
+                    </Text>
+                  ))
+                ) : (
+                  <Text style={styles.journalTextMuted}>
+                    No notes written for this day yet. Open a photo and add a
+                    caption to fill this page.
+                  </Text>
+                )}
+              </View>
+
+              {/* Day photo strip */}
+              {page && page.photos.length > 1 && (
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={styles.storyStrip}
+                >
+                  {page.photos.map((p, i) => (
+                    <TouchableOpacity
+                      key={p.id}
+                      style={[
+                        styles.storyStripFrame,
+                        { transform: [{ rotate: i % 2 === 0 ? "2deg" : "-2deg" }] },
+                      ]}
+                      onPress={() => {
+                        setActiveTrip(storyTrip);
+                        openViewer(
+                          storyTrip.photos,
+                          storyTrip.photos.findIndex((x) => x.id === p.id),
+                          true
+                        );
+                      }}
+                    >
+                      <Image source={{ uri: p.uri }} style={styles.storyStripPhoto} />
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              )}
+
+              {/* Prev / next footer */}
+              <View style={styles.storyFooter}>
+                <TouchableOpacity
+                  style={[styles.storyNavBtn, dayIdx === 0 && { opacity: 0.3 }]}
+                  disabled={dayIdx === 0}
+                  onPress={() => setStoryDay(dayIdx - 1)}
+                >
+                  <MaterialIcons
+                    name="arrow-back"
+                    size={16}
+                    color={Atlas.color.onSurfaceVariant}
+                  />
+                  <Text style={styles.storyNavText}>Previous Day</Text>
                 </TouchableOpacity>
-              );
-            }}
-          />
+                {pages.length <= 8 ? (
+                  <View style={styles.storyDots}>
+                    {pages.map((pg, i) => (
+                      <View
+                        key={pg.key}
+                        style={[
+                          styles.storyDot,
+                          i === dayIdx && styles.storyDotActive,
+                        ]}
+                      />
+                    ))}
+                  </View>
+                ) : (
+                  <Text style={styles.storyNavText}>
+                    {dayIdx + 1} / {pages.length}
+                  </Text>
+                )}
+                <TouchableOpacity
+                  style={[
+                    styles.storyNavBtn,
+                    dayIdx >= pages.length - 1 && { opacity: 0.3 },
+                  ]}
+                  disabled={dayIdx >= pages.length - 1}
+                  onPress={() => setStoryDay(dayIdx + 1)}
+                >
+                  <Text style={styles.storyNavText}>Next Day</Text>
+                  <MaterialIcons
+                    name="arrow-forward"
+                    size={16}
+                    color={Atlas.color.onSurfaceVariant}
+                  />
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Travel ephemera */}
+            <View style={styles.ephemeraCard}>
+              <MaterialIcons name="photo-camera" size={28} color={Atlas.color.secondary} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.ephemeraTitle}>Memories</Text>
+                <Text style={styles.ephemeraValue}>
+                  {storyTrip.photos.length} photo
+                  {storyTrip.photos.length === 1 ? "" : "s"} archived on this trip
+                </Text>
+              </View>
+            </View>
+            <View style={styles.ephemeraCard}>
+              <MaterialIcons name="place" size={28} color={Atlas.color.secondary} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.ephemeraTitle}>Journey</Text>
+                <Text style={styles.ephemeraValue}>
+                  {stops.length > 0
+                    ? `${stops.length} stop${stops.length === 1 ? "" : "s"} pinned on the map`
+                    : "No location data on this trip"}
+                </Text>
+              </View>
+            </View>
+          </ScrollView>
         )}
-        <TouchableOpacity style={styles.floatingBtn} onPress={() => openPicker()}>
-          <Text style={styles.primaryBtnText}>+  New Trip</Text>
-        </TouchableOpacity>
+        <BottomNav active="storybook" onNavigate={goTab} />
       </View>
     );
   }
 
-  // ---------- HOME ----------
+  // ---------- ALBUMS (landing) ----------
+  const albumGridData: (Trip | { id: "__new__" })[] = [
+    ...albumTrips,
+    { id: "__new__" },
+  ];
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>My Trips</Text>
-      <Text style={styles.subtitle}>Relive your journeys</Text>
-
-      <TouchableOpacity
-        style={styles.button}
-        onPress={() => setScreen("globalmap")}
-      >
-        <Text style={styles.buttonText}>{"🌍"}{"  "}Global Map</Text>
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        style={[styles.button, styles.buttonAlt]}
-        onPress={() => setScreen("albums")}
-      >
-        <Text style={styles.buttonText}>{"📔"}{"  "}Albums</Text>
-      </TouchableOpacity>
+    <View style={styles.screen}>
+      <TopAppBar />
+      <FlatList
+        key="albums-grid"
+        data={albumGridData}
+        keyExtractor={(t) => t.id}
+        numColumns={2}
+        columnWrapperStyle={styles.albumColumns}
+        contentContainerStyle={styles.albumsBody}
+        ListHeaderComponent={
+          <View style={styles.albumsHeader}>
+            <Text style={styles.eyebrow}>Your Curated History</Text>
+            <Text style={styles.albumsTitle} numberOfLines={1}>
+              Albums & Archives
+            </Text>
+            {albumTrips.length > 0 && (
+              <Text style={styles.albumsStats}>
+                {albumTrips.length} trip{albumTrips.length === 1 ? "" : "s"}
+                {" · "}
+                {albumTrips.reduce((n, t) => n + t.photos.length, 0)} memories
+              </Text>
+            )}
+          </View>
+        }
+        renderItem={({ item, index }) => {
+          if (item.id === "__new__") {
+            return (
+              <TouchableOpacity
+                style={styles.newJournalCard}
+                onPress={() => openPicker()}
+                activeOpacity={0.8}
+              >
+                <View style={styles.newJournalPlus}>
+                  <MaterialIcons name="add" size={22} color={Atlas.color.primary} />
+                </View>
+                <Text style={styles.newJournalText}>New Journal</Text>
+              </TouchableOpacity>
+            );
+          }
+          const trip = item as Trip;
+          const isEditing = editingTripId === trip.id;
+          return (
+            <TouchableOpacity
+              style={[
+                styles.polaroidCard,
+                { transform: [{ rotate: CARD_ROTATIONS[index % CARD_ROTATIONS.length] }] },
+              ]}
+              activeOpacity={0.85}
+              onPress={() => {
+                if (isEditing) return;
+                setActiveTrip(trip);
+                setScreen("album");
+              }}
+              onLongPress={() => albumCardMenu(trip)}
+            >
+              <View style={styles.polaroidPhotoWrap}>
+                {trip.photos[0] ? (
+                  <Image
+                    source={{ uri: trip.photos[0].uri }}
+                    style={styles.polaroidPhoto}
+                  />
+                ) : (
+                  <View style={[styles.polaroidPhoto, styles.polaroidPhotoEmpty]}>
+                    <MaterialIcons
+                      name="photo-library"
+                      size={28}
+                      color={Atlas.color.outlineVariant}
+                    />
+                  </View>
+                )}
+              </View>
+              <View style={styles.polaroidMeta}>
+                {isEditing ? (
+                  <TextInput
+                    style={styles.polaroidTitleInput}
+                    value={editingName}
+                    onChangeText={setEditingName}
+                    autoFocus
+                    returnKeyType="done"
+                    onSubmitEditing={confirmEdit}
+                    onBlur={confirmEdit}
+                  />
+                ) : (
+                  <Text style={styles.polaroidTitle} numberOfLines={2}>
+                    {trip.name}
+                  </Text>
+                )}
+                <Text style={styles.polaroidSub}>
+                  {trip.photos.length} Memor{trip.photos.length === 1 ? "y" : "ies"}
+                </Text>
+              </View>
+              {trip.destination === "both" && (
+                <View style={styles.artifactStamp}>
+                  <Text style={styles.artifactStampText}>On Map</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          );
+        }}
+      />
+      <BottomNav active="albums" onNavigate={goTab} />
     </View>
   );
 }
 
-function Header({
-  title,
-  onBack,
-  backLabel,
-  rightAction,
-}: {
-  title: string;
-  onBack: () => void;
-  backLabel: string;
-  rightAction?: React.ReactNode;
-}) {
-  return (
-    <View style={styles.header}>
-      <TouchableOpacity onPress={onBack} style={{ minWidth: 70 }}>
-        <Text style={styles.back}>{"‹"} {backLabel}</Text>
-      </TouchableOpacity>
-      <Text style={styles.headerTitle} numberOfLines={1}>
-        {title}
-      </Text>
-      <View style={{ minWidth: 70, alignItems: "flex-end" }}>
-        {rightAction}
-      </View>
-    </View>
-  );
-}
+const C = Atlas.color;
+const S = Atlas.space;
+const R = Atlas.radius;
+const T = Atlas.type;
+const F = Atlas.font;
 
 const styles = StyleSheet.create({
-  container: {
+  screen: { flex: 1, backgroundColor: C.background },
+  center: {
     flex: 1,
-    backgroundColor: "#faf8f5",
     alignItems: "center",
     justifyContent: "center",
-    padding: 24,
+    padding: S.gutter,
   },
-  screen: { flex: 1, backgroundColor: "#faf8f5" },
-  title: { fontSize: 36, fontWeight: "700", color: "#2b2b2b" },
-  subtitle: { fontSize: 16, color: "#9a8c7a", marginBottom: 48 },
-  button: {
-    backgroundColor: "#8b3a2f",
-    paddingVertical: 20,
-    paddingHorizontal: 32,
-    borderRadius: 14,
-    width: "100%",
-    alignItems: "center",
-    marginBottom: 16,
-  },
-  buttonAlt: { backgroundColor: "#c79a6b" },
-  buttonText: { color: "#fff", fontSize: 20, fontWeight: "600" },
-
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingTop: 60,
-    paddingHorizontal: 16,
-    paddingBottom: 12,
-    backgroundColor: "#faf8f5",
-  },
-  back: { color: "#8b3a2f", fontSize: 18, fontWeight: "600" },
-  headerTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#2b2b2b",
-    flex: 1,
+  emptyText: {
+    ...T.labelMd,
+    color: C.onSurfaceVariant,
+    marginTop: S.stackSm + 4,
     textAlign: "center",
   },
 
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
-  muted: { color: "#9a8c7a", marginTop: 12, fontSize: 15, textAlign: "center" },
-
-  gridThumb: {
-    flex: 1 / 3,
-    aspectRatio: 1,
-    margin: 2,
-    borderRadius: 6,
-    backgroundColor: "#eee",
+  // ---- Top app bar ----
+  appBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingTop: 58,
+    paddingBottom: S.stackSm,
+    paddingHorizontal: S.marginMobile,
+    backgroundColor: C.background,
+    borderBottomWidth: 1,
+    borderBottomColor: C.borderThin,
   },
-  pickCell: { flex: 1 / 3, aspectRatio: 1, margin: 2, position: "relative" },
+  appBarLeft: { flexDirection: "row", alignItems: "center", gap: 16 },
+  appBarTitle: {
+    ...T.headlineLgMobile,
+    color: C.primary,
+    letterSpacing: -0.5,
+  },
+  appBarAvatar: {
+    width: 40,
+    height: 40,
+    borderRadius: R.full,
+    backgroundColor: C.secondaryContainer,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
+  },
+
+  // ---- Sub header (secondary screens) ----
+  subHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingTop: 58,
+    paddingBottom: 12,
+    paddingHorizontal: S.marginMobile,
+    backgroundColor: C.background,
+    borderBottomWidth: 1,
+    borderBottomColor: C.borderThin,
+  },
+  subHeaderBack: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    minWidth: 76,
+  },
+  subHeaderBackText: {
+    ...T.labelMd,
+    color: C.onSurfaceVariant,
+    textTransform: "uppercase",
+  },
+  subHeaderMiddle: { flex: 1, alignItems: "center" },
+  subHeaderTitle: {
+    fontFamily: F.sansSemiBold,
+    fontSize: 17,
+    color: C.primary,
+  },
+  subHeaderSub: {
+    fontFamily: F.mono,
+    fontSize: 11,
+    letterSpacing: 1,
+    color: C.onSurfaceVariant,
+    textTransform: "uppercase",
+    marginTop: 1,
+  },
+  subHeaderRight: { minWidth: 76, alignItems: "flex-end" },
+  headerAction: { ...T.labelMd, color: C.primary },
+
+  // ---- Bottom nav ----
+  bottomNav: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingTop: S.stackSm,
+    paddingBottom: 30,
+    paddingHorizontal: S.marginMobile,
+    backgroundColor: "rgba(253,248,248,0.94)",
+    borderTopWidth: 1,
+    borderTopColor: C.borderFaint,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: -3 },
+    elevation: 10,
+  },
+  // Each item gets an equal flex slot so the bar is centered identically
+  // on every screen regardless of label widths/weights.
+  navItem: { flex: 1, alignItems: "center", justifyContent: "center" },
+  navLabel: {
+    ...T.labelMd,
+    color: C.onSurfaceVariant,
+    marginTop: 4,
+  },
+  navLabelActive: { fontFamily: F.monoBold, color: C.primary },
+
+  // ---- Albums ----
+  albumsBody: { paddingBottom: 180 },
+  albumsHeader: {
+    paddingHorizontal: S.marginMobile,
+    paddingTop: S.stackMd + 8,
+    paddingBottom: S.stackMd,
+  },
+  eyebrow: {
+    ...T.labelMd,
+    color: C.onSurfaceVariant,
+    textTransform: "uppercase",
+    letterSpacing: 2,
+    marginBottom: S.unit,
+  },
+  albumsTitle: { ...T.headlineLgMobile, fontSize: 26, lineHeight: 31, color: C.primary },
+  albumsStats: {
+    fontFamily: F.monoItalic,
+    fontSize: 12,
+    letterSpacing: 0.6,
+    color: C.onSurfaceVariant,
+    marginTop: 6,
+  },
+  albumColumns: { paddingHorizontal: S.marginMobile, gap: 16 },
+  polaroidCard: {
+    flex: 1,
+    backgroundColor: C.surfaceContainerLowest,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    borderRadius: R.sm,
+    marginBottom: 16,
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
+  },
+  polaroidPhotoWrap: { borderRadius: R.sm, overflow: "hidden" },
+  polaroidPhoto: {
+    width: "100%",
+    aspectRatio: 4 / 5,
+    backgroundColor: C.surfaceContainer,
+  },
+  polaroidPhotoEmpty: { alignItems: "center", justifyContent: "center" },
+  polaroidMeta: { paddingTop: S.stackMd, paddingBottom: S.stackSm, alignItems: "center" },
+  polaroidTitle: {
+    ...T.journalEntry,
+    fontSize: 16,
+    lineHeight: 22,
+    color: C.primary,
+    textAlign: "center",
+  },
+  polaroidTitleInput: {
+    fontFamily: F.mono,
+    fontSize: 16,
+    color: C.primary,
+    textAlign: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: C.primary,
+    paddingVertical: 0,
+    minWidth: 90,
+  },
+  polaroidSub: {
+    fontFamily: F.monoItalic,
+    fontSize: 12,
+    letterSpacing: 0.6,
+    color: "rgba(68,71,72,0.7)",
+    marginTop: 4,
+  },
+  artifactStamp: {
+    position: "absolute",
+    top: 8,
+    right: 8,
+    backgroundColor: "rgba(232,226,214,0.65)",
+    borderWidth: 1.5,
+    borderColor: C.borderThin,
+    borderRadius: R.sm,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    transform: [{ rotate: "12deg" }],
+  },
+  artifactStampText: {
+    fontFamily: F.mono,
+    fontSize: 9,
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    color: C.onSecondaryContainer,
+  },
+  newJournalCard: {
+    flex: 1,
+    minHeight: 200,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: C.borderDashed,
+    borderRadius: R.sm,
+    backgroundColor: "rgba(247,243,242,0.5)",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  newJournalPlus: {
+    width: 40,
+    height: 40,
+    borderRadius: R.full,
+    borderWidth: 1,
+    borderColor: C.borderDashed,
+    backgroundColor: "rgba(255,255,255,0.5)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  newJournalText: {
+    fontFamily: F.mono,
+    fontSize: 10,
+    letterSpacing: 2,
+    textTransform: "uppercase",
+    color: C.primary,
+  },
+
+  // ---- World map ----
+  mapCrumbRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: S.marginMobile,
+    paddingTop: 16,
+    marginBottom: S.stackMd,
+    gap: 12,
+  },
+  crumbs: { flexDirection: "row", alignItems: "center", gap: 4 },
+  crumbMuted: { ...T.labelMd, color: C.onSurfaceVariant, opacity: 0.6 },
+  crumbActive: { fontFamily: F.monoBold, fontSize: 14, letterSpacing: 0.7, color: C.primary },
+  artifactBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    flexShrink: 1,
+    backgroundColor: C.secondaryContainer,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    borderRadius: R.sm,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    transform: [{ rotate: "-2deg" }],
+    maxWidth: SCREEN_W - S.marginMobile * 2 - 140,
+  },
+  artifactBadgeText: {
+    flexShrink: 1,
+    fontFamily: F.mono,
+    fontSize: 12,
+    letterSpacing: 1.2,
+    textTransform: "uppercase",
+    color: C.onSecondaryContainer,
+  },
+  mapFrame: {
+    flex: 1,
+    marginHorizontal: S.marginMobile,
+    marginBottom: 102,
+    borderRadius: R.lg,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    backgroundColor: "rgba(232,226,214,0.4)",
+  },
+  mapEmpty: { flex: 1, alignItems: "center", justifyContent: "center", padding: S.gutter },
+  mapPin: { alignItems: "center" },
+  mapPinLabel: {
+    fontFamily: F.mono,
+    fontSize: 11,
+    color: C.onSurface,
+    backgroundColor: "rgba(253,248,248,0.9)",
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: R.sm,
+    overflow: "hidden",
+    maxWidth: 130,
+    marginTop: 2,
+  },
+  mapControls: {
+    position: "absolute",
+    bottom: S.gutter,
+    right: S.gutter,
+    gap: 8,
+  },
+  mapCtrlBtn: {
+    width: 48,
+    height: 48,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(253,248,248,0.85)",
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    borderRadius: R.sm,
+  },
+  mapCtrlBtnDark: { backgroundColor: C.primary, marginTop: 8 },
+  mapBackBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.surfaceContainerLowest,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    borderRadius: R.sm,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  mapBackBtnText: {
+    fontFamily: F.mono,
+    fontSize: 13,
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    color: C.primary,
+  },
+  // ---- Storybook ----
+  storyBody: {
+    paddingHorizontal: S.marginMobile,
+    paddingTop: S.stackMd,
+    paddingBottom: 150,
+  },
+  storyChipRow: { gap: 12, paddingBottom: S.stackMd, paddingHorizontal: 2 },
+  storyPage: {
+    backgroundColor: "rgba(255,255,255,0.55)",
+    borderWidth: 1,
+    borderColor: C.borderFaint,
+    borderRadius: R.sm,
+    padding: S.gutter,
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
+  },
+  stamp: {
+    position: "absolute",
+    top: 12,
+    right: 12,
+    width: 108,
+    height: 108,
+    borderRadius: R.full,
+    borderWidth: 2,
+    borderColor: "rgba(186,26,26,0.4)",
+    alignItems: "center",
+    justifyContent: "center",
+    transform: [{ rotate: "-12deg" }],
+    zIndex: 10,
+    opacity: 0.8,
+  },
+  stampInner: {
+    width: 96,
+    height: 96,
+    borderRadius: R.full,
+    borderWidth: 1,
+    borderColor: "rgba(186,26,26,0.4)",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 6,
+  },
+  stampSmall: {
+    fontFamily: F.mono,
+    fontSize: 8,
+    letterSpacing: 1.6,
+    textTransform: "uppercase",
+    color: "rgba(186,26,26,0.6)",
+    textAlign: "center",
+  },
+  stampDate: {
+    fontFamily: F.monoBold,
+    fontSize: 13,
+    color: "rgba(186,26,26,0.6)",
+    marginVertical: 2,
+    textAlign: "center",
+  },
+  storyEyebrow: {
+    ...T.labelMd,
+    color: C.onSurfaceVariant,
+    textTransform: "uppercase",
+    letterSpacing: 2,
+    marginBottom: S.unit,
+    paddingRight: 110,
+  },
+  storyTitle: {
+    fontFamily: F.sansBoldItalic,
+    fontSize: 42,
+    lineHeight: 46,
+    letterSpacing: -0.8,
+    color: C.primary,
+    marginBottom: S.stackMd,
+    paddingRight: 100,
+  },
+  storyPhotoFrame: {
+    backgroundColor: C.surfaceContainerLowest,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    padding: 12,
+    transform: [{ rotate: "3deg" }],
+    marginTop: S.stackSm,
+    marginBottom: S.stackMd,
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  photoTape: {
+    position: "absolute",
+    top: -10,
+    alignSelf: "center",
+    width: 60,
+    height: 20,
+    backgroundColor: "rgba(232,226,214,0.75)",
+    borderWidth: 1,
+    borderColor: C.borderFaint,
+    transform: [{ rotate: "-2deg" }],
+    zIndex: 5,
+  },
+  storyPhoto: {
+    width: "100%",
+    aspectRatio: 4 / 5,
+    backgroundColor: C.surfaceContainer,
+  },
+  storyPhotoCaption: {
+    fontFamily: F.monoItalic,
+    fontSize: 13,
+    lineHeight: 18,
+    color: C.onSurfaceVariant,
+    textAlign: "center",
+    paddingTop: 12,
+    paddingBottom: 4,
+  },
+  storyEntries: { gap: 16, marginBottom: S.stackMd },
+  journalText: { ...T.journalEntry, color: C.onSurface },
+  journalTextMuted: {
+    ...T.journalEntry,
+    fontSize: 15,
+    lineHeight: 25,
+    color: C.onSurfaceVariant,
+  },
+  storyStrip: { gap: 12, paddingVertical: 4, marginBottom: S.stackSm },
+  storyStripFrame: {
+    backgroundColor: C.surfaceContainerLowest,
+    borderWidth: 1,
+    borderColor: C.borderThin,
+    padding: 5,
+  },
+  storyStripPhoto: { width: 84, height: 84, backgroundColor: C.surfaceContainer },
+  storyFooter: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    borderTopWidth: 1,
+    borderTopColor: C.borderFaint,
+    paddingTop: S.stackMd,
+    marginTop: S.stackSm,
+  },
+  storyNavBtn: { flexDirection: "row", alignItems: "center", gap: 6 },
+  storyNavText: { ...T.labelMd, color: C.onSurfaceVariant },
+  storyDots: { flexDirection: "row", gap: 8 },
+  storyDot: {
+    width: 8,
+    height: 8,
+    borderRadius: R.full,
+    backgroundColor: C.surfaceContainerHighest,
+  },
+  storyDotActive: { backgroundColor: C.primaryContainer },
+  ephemeraCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16,
+    backgroundColor: C.surfaceContainerLow,
+    borderWidth: 1,
+    borderColor: C.borderFaint,
+    borderRadius: R.sm,
+    padding: S.marginMobile,
+    marginTop: S.gutter,
+  },
+  ephemeraTitle: {
+    fontFamily: F.sansSemiBold,
+    fontSize: 12,
+    letterSpacing: 2,
+    textTransform: "uppercase",
+    color: C.primary,
+  },
+  ephemeraValue: {
+    fontFamily: F.mono,
+    fontSize: 13,
+    lineHeight: 19,
+    color: C.onSurface,
+    marginTop: 2,
+  },
+
+  // ---- Grids / picker ----
+  gridRow: { gap: GRID_GAP, marginBottom: GRID_GAP },
+  gridThumb: {
+    width: "100%",
+    height: "100%",
+    borderRadius: R.sm,
+    backgroundColor: C.surfaceContainer,
+  },
+  pickCell: { width: CELL_SIZE, height: CELL_SIZE, position: "relative" },
   badge: {
     position: "absolute",
     top: 6,
     right: 6,
-    backgroundColor: "#8b3a2f",
+    backgroundColor: C.primary,
     width: 26,
     height: 26,
-    borderRadius: 13,
+    borderRadius: R.full,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 2,
-    borderColor: "#fff",
+    borderColor: C.surfaceContainerLowest,
   },
-  badgeText: { color: "#fff", fontWeight: "700", fontSize: 13 },
-
-  floatingBtn: {
+  badgeText: { fontFamily: F.monoBold, color: C.onPrimary, fontSize: 13 },
+  selectCheck: {
     position: "absolute",
-    bottom: 24,
+    top: 6,
+    right: 6,
+    width: 24,
+    height: 24,
+    borderRadius: R.full,
+    backgroundColor: C.primary,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    borderColor: C.surfaceContainerLowest,
+  },
+  selectCircle: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    width: 24,
+    height: 24,
+    borderRadius: R.full,
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.85)",
+    backgroundColor: "rgba(0,0,0,0.15)",
+  },
+
+  // ---- Buttons ----
+  primaryPill: {
+    position: "absolute",
+    bottom: S.gutter,
     alignSelf: "center",
-    backgroundColor: "#8b3a2f",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: C.primary,
     paddingVertical: 16,
-    paddingHorizontal: 40,
-    borderRadius: 30,
+    paddingHorizontal: 36,
+    borderRadius: R.default,
     shadowColor: "#000",
     shadowOpacity: 0.2,
     shadowRadius: 6,
     shadowOffset: { width: 0, height: 3 },
     elevation: 4,
   },
-  mapPin: { alignItems: "center" },
-  mapPinDot: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: "#8b3a2f",
-    borderWidth: 2,
-    borderColor: "#fff",
+  primaryPillText: {
+    fontFamily: F.sansBold,
+    fontSize: 16,
+    color: C.onPrimary,
   },
-  mapPinLabel: {
-    marginTop: 3,
-    fontSize: 11,
-    fontWeight: "700",
-    color: "#2b2b2b",
-    backgroundColor: "rgba(255,255,255,0.85)",
-    paddingHorizontal: 5,
-    paddingVertical: 2,
-    borderRadius: 4,
-    overflow: "hidden",
-    maxWidth: 120,
-  },
-  mapBackBtn: {
-    position: "absolute",
-    top: 110,
-    left: 16,
-    backgroundColor: "rgba(255,255,255,0.93)",
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    borderRadius: 20,
-    shadowColor: "#000",
-    shadowOpacity: 0.15,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 3,
-  },
-  mapBackBtnText: {
-    color: "#8b3a2f",
-    fontSize: 15,
-    fontWeight: "700",
-  },
-
   primaryBtn: {
-    backgroundColor: "#8b3a2f",
+    backgroundColor: C.primary,
     paddingVertical: 16,
-    borderRadius: 14,
+    borderRadius: R.default,
     alignItems: "center",
   },
-  primaryBtnText: { color: "#fff", fontSize: 17, fontWeight: "700" },
+  primaryBtnText: { fontFamily: F.sansBold, fontSize: 16, color: C.onPrimary },
 
-  label: { fontSize: 15, fontWeight: "700", color: "#2b2b2b", marginBottom: 8 },
-  input: {
-    borderWidth: 1,
-    borderColor: "#e2d8cc",
-    borderRadius: 12,
-    padding: 14,
+  // ---- Details form ----
+  detailsBody: { padding: S.marginMobile, paddingTop: S.stackLg },
+  fieldLabel: {
+    ...T.labelMd,
+    color: C.onSurfaceVariant,
+    textTransform: "uppercase",
+    letterSpacing: 2,
+    marginBottom: S.stackSm,
+  },
+  fieldInput: {
+    fontFamily: F.mono,
     fontSize: 16,
-    backgroundColor: "#fff",
-    color: "#2b2b2b",
+    color: C.onSurface,
+    borderBottomWidth: 1,
+    borderBottomColor: C.primary,
+    paddingVertical: 10,
+    paddingHorizontal: 0,
   },
-  choice: {
+  choiceRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 16,
+    paddingVertical: 4,
+  },
+  tapedChip: {
+    backgroundColor: "rgba(232,226,214,0.5)",
     borderWidth: 1,
-    borderColor: "#e2d8cc",
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 10,
-    backgroundColor: "#fff",
+    borderColor: C.borderFaint,
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 1,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
   },
-  choiceActive: { borderColor: "#8b3a2f", backgroundColor: "#f6ece6" },
-  choiceText: { fontSize: 16, color: "#2b2b2b" },
-  choiceTextActive: { fontWeight: "700", color: "#8b3a2f" },
-  note: { marginTop: 18, color: "#9a8c7a", fontSize: 14, textAlign: "center" },
+  tapedChipActive: { backgroundColor: C.primary, borderColor: C.primary },
+  tapedChipText: {
+    ...T.labelMd,
+    color: C.onSecondaryContainer,
+  },
+  tapedChipTextActive: { color: C.onPrimary },
+  detailsNote: {
+    fontFamily: F.mono,
+    fontSize: 13,
+    letterSpacing: 0.6,
+    color: C.onSurfaceVariant,
+    textAlign: "center",
+    marginTop: S.stackLg,
+  },
 
-  tripCard: {
+  // ---- Select bar ----
+  selectBar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#fff",
-    borderRadius: 12,
-    padding: 10,
-    marginBottom: 10,
+    justifyContent: "space-between",
+    paddingHorizontal: S.marginMobile,
+    paddingTop: 14,
+    paddingBottom: 36,
+    backgroundColor: "rgba(253,248,248,0.97)",
+    borderTopWidth: 1,
+    borderTopColor: C.borderThin,
   },
-  tripCover: { width: 80, height: 80, borderRadius: 10, backgroundColor: "#eee" },
-  tripMeta: { marginLeft: 14, flex: 1 },
-  tripTitle: { fontSize: 16, fontWeight: "700", color: "#2b2b2b" },
-  tripTitleInput: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#2b2b2b",
-    borderBottomWidth: 1.5,
-    borderBottomColor: "#8b3a2f",
-    padding: 0,
-    margin: 0,
+  selectBarCancel: { paddingVertical: 4 },
+  selectBarCancelText: { ...T.labelMd, color: C.onSurfaceVariant },
+  selectBarDelete: {
+    backgroundColor: C.error,
+    paddingVertical: 10,
+    paddingHorizontal: 28,
+    borderRadius: R.default,
   },
-  tripSub: { fontSize: 13, color: "#9a8c7a", marginTop: 4 },
-  tripActions: { flexDirection: "column", alignItems: "center", marginLeft: 6 },
-  actionBtn: {
-    width: 36,
-    height: 36,
-    alignItems: "center",
-    justifyContent: "center",
+  selectBarDeleteDisabled: { backgroundColor: C.surfaceDim },
+  selectBarDeleteText: {
+    fontFamily: F.sansBold,
+    fontSize: 15,
+    color: C.onError,
   },
-  actionIcon: { fontSize: 18 },
-  actionConfirm: { fontSize: 22, color: "#8b3a2f", fontWeight: "700" },
 
+  // ---- Viewer ----
   viewer: { flex: 1, backgroundColor: "#000" },
   viewerHeader: {
     position: "absolute",
@@ -1503,12 +2429,18 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   viewerAlbumName: {
+    fontFamily: F.sansSemiBold,
     color: "rgba(255,255,255,0.9)",
     fontSize: 15,
-    fontWeight: "600",
     maxWidth: "70%",
   },
-  viewerCount: { color: "rgba(255,255,255,0.5)", fontSize: 12, marginTop: 2 },
+  viewerCount: {
+    fontFamily: F.mono,
+    color: "rgba(255,255,255,0.5)",
+    fontSize: 12,
+    letterSpacing: 1,
+    marginTop: 2,
+  },
   viewerClose: {
     position: "absolute",
     top: 52,
@@ -1519,22 +2451,21 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  viewerCloseText: { color: "rgba(255,255,255,0.85)", fontSize: 24 },
   viewerPage: { width: SCREEN_W, flex: 1, paddingTop: 100, paddingBottom: 40 },
   viewerImageWrap: { flex: 1, justifyContent: "center" },
   viewerImage: { width: "100%", height: "100%" },
-  captionZone: { height: 96, marginHorizontal: 20, marginTop: 8 },
+  captionZone: { height: 96, marginHorizontal: S.marginMobile, marginTop: S.stackSm },
   captionInput: {
     flex: 1,
+    fontFamily: F.mono,
     color: "#fff",
     fontSize: 16,
-    fontWeight: "400",
+    letterSpacing: 0.5,
     textAlign: "center",
     textShadowColor: "rgba(0,0,0,0.6)",
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 3,
   },
-
   viewerTrash: {
     position: "absolute",
     top: 52,
@@ -1545,59 +2476,4 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  viewerTrashIcon: { fontSize: 22 },
-
-  headerAction: { color: "#8b3a2f", fontSize: 16, fontWeight: "600" },
-
-  selectCheck: {
-    position: "absolute",
-    top: 6,
-    right: 6,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: "#8b3a2f",
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 2,
-    borderColor: "#fff",
-  },
-  selectCheckText: { color: "#fff", fontWeight: "700", fontSize: 14 },
-  selectCircle: {
-    position: "absolute",
-    top: 6,
-    right: 6,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    borderWidth: 2,
-    borderColor: "rgba(255,255,255,0.85)",
-    backgroundColor: "rgba(0,0,0,0.15)",
-  },
-
-  selectBar: {
-    position: "absolute",
-    bottom: 0,
-    left: 0,
-    right: 0,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 20,
-    paddingTop: 14,
-    paddingBottom: 36,
-    backgroundColor: "rgba(250,248,245,0.97)",
-    borderTopWidth: 1,
-    borderTopColor: "#e2d8cc",
-  },
-  selectBarCancel: { paddingVertical: 4 },
-  selectBarCancelText: { fontSize: 16, color: "#9a8c7a", fontWeight: "600" },
-  selectBarDelete: {
-    backgroundColor: "#8b3a2f",
-    paddingVertical: 10,
-    paddingHorizontal: 28,
-    borderRadius: 22,
-  },
-  selectBarDeleteDisabled: { backgroundColor: "#c9a99a" },
-  selectBarDeleteText: { color: "#fff", fontWeight: "700", fontSize: 15 },
 });

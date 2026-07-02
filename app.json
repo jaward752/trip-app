@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "trip-app",
-    "slug": "trip-app",
+    "name": "Waypost",
+    "slug": "waypost",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
