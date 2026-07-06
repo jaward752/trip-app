@@ -1,3 +1,4 @@
+import { Caveat_600SemiBold } from '@expo-google-fonts/caveat';
 import {
   CourierPrime_400Regular,
   CourierPrime_400Regular_Italic,
@@ -16,10 +17,11 @@ import { useFonts } from 'expo-font';
 import { Stack } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 
+import IntroAnimation from '@/components/intro-animation';
 import { Atlas } from '@/constants/theme';
 
 export const unstable_settings = {
@@ -27,6 +29,11 @@ export const unstable_settings = {
 };
 
 SplashScreen.preventAutoHideAsync();
+
+// True once the Route 66 intro has played in this JS runtime. Module scope
+// means it survives re-renders and remounts but resets on a cold launch —
+// exactly the "play once per app start, not per foreground" behavior we want.
+let introPlayedThisLaunch = false;
 
 // The Atlas of Life design system is light-only ("Aged Paper" palette).
 const AtlasNavTheme = {
@@ -52,7 +59,17 @@ export default function RootLayout() {
     CourierPrime_400Regular,
     CourierPrime_400Regular_Italic,
     CourierPrime_700Bold,
+    Caveat_600SemiBold,
   });
+
+  const [showIntro, setShowIntro] = useState(() => !introPlayedThisLaunch);
+  const handleIntroDone = useCallback(() => setShowIntro(false), []);
+
+  useEffect(() => {
+    if (showIntro) {
+      introPlayedThisLaunch = true;
+    }
+  }, [showIntro]);
 
   useEffect(() => {
     if (loaded || error) {
@@ -69,9 +86,9 @@ export default function RootLayout() {
       <ThemeProvider value={AtlasNavTheme}>
         <Stack>
           <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-          <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
         </Stack>
         <StatusBar style="dark" />
+        {showIntro && !error && <IntroAnimation onDone={handleIntroDone} />}
       </ThemeProvider>
     </GestureHandlerRootView>
   );

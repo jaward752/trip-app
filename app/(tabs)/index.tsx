@@ -3,14 +3,16 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as ImagePicker from "expo-image-picker";
 import * as MediaLibrary from "expo-media-library";
 import React, { useEffect, useRef, useState } from "react";
+import { Image } from "expo-image";
 import {
   ActivityIndicator,
   Alert,
   Dimensions,
   FlatList,
-  Image,
   Keyboard,
   KeyboardAvoidingView,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   Platform,
   ScrollView,
   StyleSheet,
@@ -21,15 +23,35 @@ import {
 } from "react-native";
 import { Directions, Gesture, GestureDetector } from "react-native-gesture-handler";
 import MapView, { Marker, Polyline } from "react-native-maps";
+import * as Haptics from "expo-haptics";
 import Animated, {
   Easing,
+  FadeIn,
   FadeInUp,
   FadeOut,
   runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
   withTiming,
 } from "react-native-reanimated";
 
+import GrainOverlay from "@/components/grain-overlay";
+import Postmark from "@/components/postmark";
+import PressableScale from "@/components/pressable-scale";
 import { Atlas } from "@/constants/theme";
+
+// Shared micro-interaction timings: screens crossfade in fast; cards settle
+// in with a short stagger. Photo loads crossfade via expo-image `transition`.
+const SCREEN_FADE = () => FadeIn.duration(180);
+const cardEnter = (index: number) =>
+  FadeInUp.duration(240).delay(Math.min(index * 40, 320));
+const PHOTO_FADE_MS = 160;
+
+// FlatList mounts rows continuously while scrolling, and `entering` fires on
+// every mount — so the card stagger must be limited to the moment a screen is
+// entered, or scrolling replays fades forever (and pays layout-animation
+// setup per row). Rows mounted after this window get no entering animation.
+const CARD_ENTER_WINDOW_MS = 600;
 
 const SCREEN_W = Dimensions.get("window").width;
 const STOP_RADIUS_KM = 5;
@@ -43,6 +65,24 @@ const GRID_GAP = 2;
 const GRID_PADDING = 4;
 const CELL_SIZE =
   (SCREEN_W - GRID_PADDING * 2 - GRID_GAP * (GRID_COLS - 1)) / GRID_COLS;
+
+// Shared perf props for the photo grids. With numColumns, FlatList
+// virtualizes whole rows, so getItemLayout and the render counts are in rows.
+const GRID_ROW_H = CELL_SIZE + GRID_GAP;
+const GRID_PERF = {
+  getItemLayout: (
+    _: ArrayLike<Photo> | null | undefined,
+    index: number
+  ) => ({
+    length: GRID_ROW_H,
+    offset: GRID_ROW_H * index,
+    index,
+  }),
+  initialNumToRender: 10,
+  maxToRenderPerBatch: 8,
+  windowSize: 9,
+  removeClippedSubviews: true,
+} as const;
 
 // Polaroid rotations from the Stitch Albums screen, in card order.
 const CARD_ROTATIONS = ["-1deg", "2deg", "-0.5deg", "1.5deg", "-2.5deg"];
@@ -62,6 +102,17 @@ type Photo = {
 };
 
 type Destination = "album" | "map" | "both";
+
+// Taped-label chips on the trip-details form, with their hand-placed tilts.
+const DESTINATION_CHIPS: {
+  destination: Destination;
+  label: string;
+  rotate: string;
+}[] = [
+  { destination: "album", label: "#Album", rotate: "-1deg" },
+  { destination: "map", label: "#Map", rotate: "2deg" },
+  { destination: "both", label: "#Both", rotate: "-1deg" },
+];
 
 type Trip = {
   id: string;
@@ -100,7 +151,11 @@ function toNum(v: unknown): number | null {
   return null;
 }
 
-function exifDate(exif: Record<string, any> | null | undefined): Date | null {
+// EXIF blobs come from the picker as untyped bags of vendor fields, so every
+// value is `unknown` until checked.
+type Exif = Record<string, unknown> | null | undefined;
+
+function exifDate(exif: Exif): Date | null {
   const raw = exif?.DateTimeOriginal ?? exif?.DateTime;
   if (typeof raw !== "string") return null;
   const m = raw.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
@@ -110,7 +165,7 @@ function exifDate(exif: Record<string, any> | null | undefined): Date | null {
 }
 
 function exifCoord(
-  exif: Record<string, any> | null | undefined,
+  exif: Exif,
   key: "GPSLatitude" | "GPSLongitude",
   negativeRef: "S" | "W"
 ): number | null {
@@ -125,48 +180,123 @@ function exifCoord(
 // Turn native-picker results into Photos. Metadata (GPS, creation date,
 // permanent local URI) comes from the media library via assetId so trips
 // survive relaunches; EXIF from the picked copy is the fallback.
-async function pickedToPhotos(
+//
+// Large batches (100+) must not block on one slow asset, so lookups run a
+// few at a time with a timeout each. Cloud-only originals are NOT downloaded:
+// the metadata comes back without the file, and the picker's local copy
+// (a.uri) is always available for display.
+const ENRICH_CONCURRENCY = 8;
+const ENRICH_TIMEOUT_MS = 5000;
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
+// Order-preserving map with a bounded worker pool.
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker)
+  );
+  return results;
+}
+
+function pickedToPhotos(
   assets: ImagePicker.ImagePickerAsset[]
 ): Promise<Photo[]> {
-  const photos: Photo[] = [];
-  for (const a of assets) {
+  return mapWithConcurrency(assets, ENRICH_CONCURRENCY, async (a) => {
     let uri = a.uri;
     let date = exifDate(a.exif);
     let lat = exifCoord(a.exif, "GPSLatitude", "S");
     let lon = exifCoord(a.exif, "GPSLongitude", "W");
     if (a.assetId) {
       try {
-        const info = await MediaLibrary.getAssetInfoAsync(a.assetId, {
-          shouldDownloadFromNetwork: true,
-        });
-        uri = info.localUri ?? info.uri ?? uri;
+        const info = await withTimeout(
+          MediaLibrary.getAssetInfoAsync(a.assetId, {
+            shouldDownloadFromNetwork: false,
+          }),
+          ENRICH_TIMEOUT_MS
+        );
+        uri = info.localUri ?? uri;
         if (info.creationTime) date = new Date(info.creationTime);
-        lat = toNum(info.location?.latitude) ?? lat;
-        lon = toNum(info.location?.longitude) ?? lon;
+        if (info.location) {
+          lat = info.location.latitude;
+          lon = info.location.longitude;
+        }
       } catch {
         // keep the EXIF-derived values and the picker's cached copy
       }
     }
-    photos.push({
+    return {
       id: a.assetId ?? a.uri,
       uri,
       date,
       lat,
       lon,
       caption: "",
-    });
-  }
-  return photos;
+    };
+  });
+}
+
+function byPhotoDate(a: Photo, b: Photo): number {
+  if (!a.date) return 1;
+  if (!b.date) return -1;
+  return a.date.getTime() - b.date.getTime();
 }
 
 function fmtStamp(d: Date): string {
   return `${d.getDate()} ${MONTHS[d.getMonth()].toUpperCase()} ${d.getFullYear()}`;
 }
 
+function plural(n: number, word: string, pluralWord = word + "s"): string {
+  return `${n} ${n === 1 ? word : pluralWord}`;
+}
+
 // ---------- PERSISTENCE ----------
 
+// Trip shape persisted to AsyncStorage under STORAGE_KEY. Photo URIs are
+// deliberately not stored; they are re-resolved from the media library on
+// load. Dates are stored as epoch millis.
+type StoredPhoto = {
+  id: string;
+  date: number | null;
+  lat: number | null;
+  lon: number | null;
+  caption: string;
+};
+
+type StoredTrip = {
+  id: string;
+  name: string;
+  destination: Destination;
+  photos: StoredPhoto[];
+};
+
 function serializeTrips(trips: Trip[]): string {
-  const plain = trips.map((t) => ({
+  const plain: StoredTrip[] = trips.map((t) => ({
     id: t.id,
     name: t.name,
     destination: t.destination,
@@ -185,55 +315,67 @@ async function saveTripsToStorage(trips: Trip[]) {
   try {
     await AsyncStorage.setItem(STORAGE_KEY, serializeTrips(trips));
   } catch (e) {
-    // ignore write errors for now
+    console.error("Failed to persist trips to AsyncStorage:", e);
   }
 }
 
 async function loadTripsFromStorage(): Promise<Trip[]> {
+  let plain: StoredTrip[];
   try {
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
-    const plain = JSON.parse(raw) as any[];
-
-    const trips: Trip[] = [];
-    for (const t of plain) {
-      const photos: Photo[] = [];
-      for (const p of t.photos) {
-        let uri = "";
-        try {
-          const info = await MediaLibrary.getAssetInfoAsync(p.id);
-          uri = info.localUri ?? info.uri ?? "";
-        } catch {
-          uri = "";
-        }
-        if (!uri) continue;
-        photos.push({
-          id: p.id,
-          uri,
-          date: p.date ? new Date(p.date) : null,
-          lat: p.lat ?? null,
-          lon: p.lon ?? null,
-          caption: p.caption ?? "",
-        });
-      }
-      trips.push({
-        id: t.id,
-        name: t.name,
-        destination: t.destination,
-        photos,
-      });
-    }
-    return trips;
+    plain = JSON.parse(raw) as StoredTrip[];
   } catch (e) {
+    console.error("Failed to load trips from AsyncStorage:", e);
     return [];
   }
+
+  // Re-resolve every photo's URI from the media library with the same
+  // bounded-concurrency pool used on import. Cloud-only originals are not
+  // downloaded; expo-image renders their ph:// asset URIs directly.
+  const slots = plain.flatMap((t, tripIdx) =>
+    t.photos.map((p) => ({ tripIdx, p }))
+  );
+  const uris = await mapWithConcurrency(slots, ENRICH_CONCURRENCY, async (s) => {
+    try {
+      const info = await withTimeout(
+        MediaLibrary.getAssetInfoAsync(s.p.id, {
+          shouldDownloadFromNetwork: false,
+        }),
+        ENRICH_TIMEOUT_MS
+      );
+      return info.localUri ?? info.uri;
+    } catch {
+      return ""; // asset gone (or lookup hung) -> photo drops out below
+    }
+  });
+
+  const trips: Trip[] = plain.map((t) => ({
+    id: t.id,
+    name: t.name,
+    destination: t.destination,
+    photos: [],
+  }));
+  slots.forEach((s, i) => {
+    if (!uris[i]) return;
+    trips[s.tripIdx].photos.push({
+      id: s.p.id,
+      uri: uris[i],
+      date: s.p.date ? new Date(s.p.date) : null,
+      lat: s.p.lat,
+      lon: s.p.lon,
+      caption: s.p.caption,
+    });
+  });
+  return trips;
 }
 
+// Storyboards are pure JSON-safe data, so they round-trip as-is.
 async function saveStoryboardsToStorage(storyboards: Storyboard[]) {
   try {
     await AsyncStorage.setItem(STORY_STORAGE_KEY, JSON.stringify(storyboards));
-  } catch {
-    // ignore write errors for now
+  } catch (e) {
+    console.error("Failed to persist storyboards to AsyncStorage:", e);
   }
 }
 
@@ -241,20 +383,9 @@ async function loadStoryboardsFromStorage(): Promise<Storyboard[]> {
   try {
     const raw = await AsyncStorage.getItem(STORY_STORAGE_KEY);
     if (!raw) return [];
-    const plain = JSON.parse(raw) as any[];
-    return plain.map((s) => ({
-      id: String(s.id),
-      title: String(s.title ?? "Untitled story"),
-      sourceTripId: String(s.sourceTripId),
-      pages: Array.isArray(s.pages)
-        ? s.pages.map((p: any) => ({
-            photoId: String(p.photoId),
-            caption: String(p.caption ?? ""),
-          }))
-        : [],
-      createdAt: typeof s.createdAt === "number" ? s.createdAt : 0,
-    }));
-  } catch {
+    return JSON.parse(raw) as Storyboard[];
+  } catch (e) {
+    console.error("Failed to load storyboards from AsyncStorage:", e);
     return [];
   }
 }
@@ -314,11 +445,7 @@ function distanceKm(
 function clusterIntoStops(photos: Photo[]): Stop[] {
   const located = photos
     .filter((p) => p.lat !== null && p.lon !== null)
-    .sort((a, b) => {
-      if (!a.date) return 1;
-      if (!b.date) return -1;
-      return a.date.getTime() - b.date.getTime();
-    });
+    .sort(byPhotoDate);
 
   if (located.length === 0) return [];
 
@@ -398,6 +525,31 @@ type Tab = "albums" | "globalmap" | "storybook";
 
 // ---------- SHARED CHROME ----------
 
+// Hairline divider drawn as the route-dash motif (same dash rhythm as the
+// map polyline and the intro's road centerline).
+function RouteDivider() {
+  return (
+    <View style={styles.routeDividerClip}>
+      <View style={styles.routeDividerLine} />
+    </View>
+  );
+}
+
+// Vintage odometer: each digit sits in its own dark rolling-counter cell.
+function Odometer({ value }: { value: number }) {
+  return (
+    <View style={styles.odoRow}>
+      {String(value)
+        .split("")
+        .map((d, i) => (
+          <View key={i} style={styles.odoCell}>
+            <Text style={styles.odoDigit}>{d}</Text>
+          </View>
+        ))}
+    </View>
+  );
+}
+
 function TopAppBar() {
   return (
     <View style={styles.appBar}>
@@ -407,6 +559,9 @@ function TopAppBar() {
       </View>
       <View style={styles.appBarAvatar}>
         <MaterialIcons name="person" size={22} color={Atlas.color.onSecondaryContainer} />
+      </View>
+      <View style={styles.appBarDivider}>
+        <RouteDivider />
       </View>
     </View>
   );
@@ -442,32 +597,317 @@ function SubHeader({
   );
 }
 
+function EmptyState({
+  icon,
+  message,
+}: {
+  icon?: keyof typeof MaterialIcons.glyphMap;
+  message: string;
+}) {
+  return (
+    <View style={styles.center}>
+      {icon && <MaterialIcons name={icon} size={36} color={Atlas.color.outline} />}
+      <Text style={styles.emptyText}>{message}</Text>
+    </View>
+  );
+}
+
+// Header-right "Select"/"Cancel" toggle for the photo-grid screens.
+function SelectToggle({
+  selectMode,
+  onEnter,
+  onExit,
+}: {
+  selectMode: boolean;
+  onEnter: () => void;
+  onExit: () => void;
+}) {
+  return (
+    <TouchableOpacity onPress={selectMode ? onExit : onEnter}>
+      <Text style={styles.headerAction}>{selectMode ? "Cancel" : "Select"}</Text>
+    </TouchableOpacity>
+  );
+}
+
+// Bottom Cancel/Delete bar shown while selecting photos in a grid.
+function SelectBar({
+  count,
+  onCancel,
+  onDelete,
+}: {
+  count: number;
+  onCancel: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <View style={styles.selectBar}>
+      <TouchableOpacity onPress={onCancel} style={styles.selectBarCancel}>
+        <Text style={styles.selectBarCancelText}>Cancel</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[
+          styles.selectBarDelete,
+          count === 0 && styles.selectBarDeleteDisabled,
+        ]}
+        onPress={onDelete}
+        disabled={count === 0}
+      >
+        <Text style={styles.selectBarDeleteText}>
+          {count > 0 ? `Delete (${count})` : "Delete"}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+// The 4-column virtualized photo grid shared by the album, stop, and
+// storyboard-pick screens. `overlay` draws per-cell selection chrome.
+function PhotoGrid({
+  photos,
+  onPressCell,
+  overlay,
+  bottomPadding = 110,
+}: {
+  photos: Photo[];
+  onPressCell: (photo: Photo, index: number) => void;
+  overlay?: (photo: Photo) => React.ReactNode;
+  bottomPadding?: number;
+}) {
+  return (
+    <FlatList
+      data={photos}
+      keyExtractor={(p) => p.id}
+      numColumns={GRID_COLS}
+      {...GRID_PERF}
+      columnWrapperStyle={styles.gridRow}
+      contentContainerStyle={{
+        padding: GRID_PADDING,
+        paddingBottom: bottomPadding,
+      }}
+      renderItem={({ item, index }) => (
+        <TouchableOpacity
+          style={styles.pickCell}
+          onPress={() => onPressCell(item, index)}
+          activeOpacity={0.85}
+        >
+          <Image
+            source={{ uri: item.uri }}
+            style={styles.gridThumb}
+            recyclingKey={item.id}
+            cachePolicy="memory-disk"
+            transition={PHOTO_FADE_MS}
+          />
+          {overlay?.(item)}
+        </TouchableOpacity>
+      )}
+    />
+  );
+}
+
+// Check/circle overlay for a grid cell while select mode is active.
+function SelectOverlay({ selected }: { selected: boolean }) {
+  return selected ? (
+    <View style={styles.selectCheck}>
+      <MaterialIcons name="check" size={15} color={Atlas.color.onPrimary} />
+    </View>
+  ) : (
+    <View style={styles.selectCircle} />
+  );
+}
+
+// Dashed "create new" card at the end of the albums and storybook grids.
+function NewItemCard({
+  label,
+  entering,
+  onPress,
+}: {
+  label: string;
+  entering: ReturnType<typeof cardEnter> | undefined;
+  onPress: () => void;
+}) {
+  return (
+    <PressableScale
+      style={styles.newJournalCard}
+      entering={entering}
+      scaleTo={0.96}
+      haptic="light"
+      onPress={onPress}
+    >
+      <View style={styles.newJournalPlus}>
+        <MaterialIcons name="add" size={22} color={Atlas.color.primary} />
+      </View>
+      <Text style={styles.newJournalText}>{label}</Text>
+    </PressableScale>
+  );
+}
+
+// Inline rename field on the polaroid cards (trips and storyboards).
+function TitleEditInput({
+  value,
+  onChangeText,
+  onCommit,
+}: {
+  value: string;
+  onChangeText: (text: string) => void;
+  onCommit: () => void;
+}) {
+  return (
+    <TextInput
+      style={styles.polaroidTitleInput}
+      value={value}
+      onChangeText={onChangeText}
+      autoFocus
+      returnKeyType="done"
+      onSubmitEditing={onCommit}
+      onBlur={onCommit}
+    />
+  );
+}
+
+const NAV_ITEMS: { tab: Tab; icon: keyof typeof MaterialIcons.glyphMap; label: string }[] = [
+  { tab: "albums", icon: "photo-library", label: "Albums" },
+  { tab: "globalmap", icon: "public", label: "World Map" },
+  { tab: "storybook", icon: "auto-stories", label: "Storybook" },
+];
+
+// Which nav item sits under a touch at x, for a strip of the given width.
+function navIndexAt(x: number, stripWidth: number): number {
+  "worklet";
+  return Math.min(
+    NAV_ITEMS.length - 1,
+    Math.max(0, Math.floor((x / stripWidth) * NAV_ITEMS.length))
+  );
+}
+
+function NavItem({
+  icon,
+  label,
+  emphasized,
+  hovered,
+  onPress,
+}: {
+  icon: keyof typeof MaterialIcons.glyphMap;
+  label: string;
+  emphasized: boolean;
+  hovered: boolean;
+  onPress: () => void;
+}) {
+  const scale = useSharedValue(1);
+  useEffect(() => {
+    scale.value = withTiming(hovered ? 1.18 : 1, {
+      duration: 130,
+      easing: Easing.out(Easing.quad),
+    });
+  }, [hovered, scale]);
+  const animStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: scale.value }],
+  }));
+  return (
+    <TouchableOpacity
+      style={[styles.navItem, !emphasized && { opacity: 0.6 }]}
+      onPress={onPress}
+    >
+      <Animated.View style={[styles.navItemInner, animStyle]}>
+        <MaterialIcons
+          name={icon}
+          size={24}
+          color={emphasized ? Atlas.color.primary : Atlas.color.onSurfaceVariant}
+        />
+        <Text style={[styles.navLabel, emphasized && styles.navLabelActive]}>{label}</Text>
+      </Animated.View>
+    </TouchableOpacity>
+  );
+}
+
+// Bottom bar with Instagram-style tab scrubbing: press and hold anywhere on
+// the bar, then drag left/right — the tab under the finger highlights (with a
+// selection haptic per change) and is committed on release. Plain taps still
+// work through the touchables; quick swipes are ignored (the pan only
+// activates after the hold).
 function BottomNav({ active, onNavigate }: { active: Tab; onNavigate: (t: Tab) => void }) {
-  const items: { tab: Tab; icon: keyof typeof MaterialIcons.glyphMap; label: string }[] = [
-    { tab: "albums", icon: "photo-library", label: "Albums" },
-    { tab: "globalmap", icon: "public", label: "World Map" },
-    { tab: "storybook", icon: "auto-stories", label: "Storybook" },
-  ];
+  const [hovered, setHovered] = useState<number | null>(null);
+  const hoveredRef = useRef<number | null>(null);
+  const stripWidth = useSharedValue(0);
+
+  function hoverTo(i: number | null) {
+    if (hoveredRef.current === i) return;
+    hoveredRef.current = i;
+    setHovered(i);
+    if (i !== null) Haptics.selectionAsync();
+  }
+
+  function commitHover(i: number) {
+    onNavigate(NAV_ITEMS[i].tab);
+  }
+
+  function clearHover() {
+    hoverTo(null);
+  }
+
+  const scrub = Gesture.Pan()
+    .maxPointers(1)
+    .activateAfterLongPress(220)
+    .onStart((e) => {
+      if (stripWidth.value <= 0) return;
+      runOnJS(hoverTo)(navIndexAt(e.x, stripWidth.value));
+    })
+    .onUpdate((e) => {
+      if (stripWidth.value <= 0) return;
+      runOnJS(hoverTo)(navIndexAt(e.x, stripWidth.value));
+    })
+    .onEnd((e) => {
+      if (stripWidth.value <= 0) return;
+      runOnJS(commitHover)(navIndexAt(e.x, stripWidth.value));
+    })
+    .onFinalize(() => {
+      runOnJS(clearHover)();
+    });
+
+  const holding = hovered !== null;
   return (
     <View style={styles.bottomNav}>
-      {items.map(({ tab, icon, label }) => {
-        const isActive = tab === active;
-        return (
-          <TouchableOpacity
-            key={tab}
-            style={[styles.navItem, !isActive && { opacity: 0.6 }]}
-            onPress={() => onNavigate(tab)}
-          >
-            <MaterialIcons
-              name={icon}
-              size={24}
-              color={isActive ? Atlas.color.primary : Atlas.color.onSurfaceVariant}
+      <GestureDetector gesture={scrub}>
+        <View
+          style={styles.navStrip}
+          onLayout={(e) => {
+            stripWidth.value = e.nativeEvent.layout.width;
+          }}
+        >
+          {NAV_ITEMS.map(({ tab, icon, label }, i) => (
+            <NavItem
+              key={tab}
+              icon={icon}
+              label={label}
+              hovered={hovered === i}
+              emphasized={holding ? hovered === i : tab === active}
+              onPress={() => onNavigate(tab)}
             />
-            <Text style={[styles.navLabel, isActive && styles.navLabelActive]}>{label}</Text>
-          </TouchableOpacity>
-        );
-      })}
+          ))}
+        </View>
+      </GestureDetector>
     </View>
+  );
+}
+
+// Player photo: the polaroid frame adapts to the photo's real aspect ratio
+// (clamped so extreme shapes keep a sensible frame) instead of cropping
+// everything to 4:5 — in the player the photo is the content, so it must
+// show in full. Covers on the grid screens keep their uniform 4:5 crop.
+function StoryPhoto({ uri }: { uri: string }) {
+  const [ratio, setRatio] = useState<number | null>(null);
+  return (
+    <Image
+      source={{ uri }}
+      style={[styles.storyPhoto, ratio !== null && { aspectRatio: ratio }]}
+      contentFit="contain"
+      cachePolicy="memory-disk"
+      onLoad={(e) => {
+        const { width, height } = e.source;
+        if (width > 0 && height > 0) {
+          setRatio(Math.min(1.9, Math.max(0.65, width / height)));
+        }
+      }}
+    />
   );
 }
 
@@ -485,7 +925,9 @@ function ViewerPage({
         <Image
           source={{ uri: photo.uri }}
           style={styles.viewerImage}
-          resizeMode="contain"
+          contentFit="contain"
+          cachePolicy="memory-disk"
+          transition={PHOTO_FADE_MS}
         />
       </View>
       <View style={styles.captionZone}>
@@ -509,6 +951,18 @@ function ViewerPage({
 
 export default function HomeScreen() {
   const [screen, setScreen] = useState<Screen>("albums");
+
+  // Reopens the card-stagger window on every screen change (see
+  // CARD_ENTER_WINDOW_MS). A ref, not state: reading it in renderItem must
+  // not schedule re-renders.
+  const screenEnteredAt = useRef(Date.now());
+  useEffect(() => {
+    screenEnteredAt.current = Date.now();
+  }, [screen]);
+  const cardEntering = (index: number) =>
+    Date.now() - screenEnteredAt.current < CARD_ENTER_WINDOW_MS
+      ? cardEnter(index)
+      : undefined;
 
   const [trips, setTrips] = useState<Trip[]>([]);
   const [loadedFromStorage, setLoadedFromStorage] = useState(false);
@@ -579,7 +1033,7 @@ export default function HomeScreen() {
     // storage on the next launch.
     const perm = await MediaLibrary.requestPermissionsAsync();
     if (!perm.granted) {
-      alert("Photo access is needed.");
+      Alert.alert("Photo access is needed.");
       return;
     }
 
@@ -602,53 +1056,57 @@ export default function HomeScreen() {
 
   async function saveTrip() {
     setPreparing(true);
+    try {
+      const enriched = await pickedToPhotos(picked);
+      enriched.sort(byPhotoDate);
 
-    const enriched = await pickedToPhotos(picked);
+      const trip: Trip = {
+        id: Date.now().toString(),
+        name: tripName.trim() || "Untitled trip",
+        destination,
+        photos: enriched,
+      };
 
-    enriched.sort((a, b) => {
-      if (!a.date) return 1;
-      if (!b.date) return -1;
-      return a.date.getTime() - b.date.getTime();
-    });
-
-    const trip: Trip = {
-      id: Date.now().toString(),
-      name: tripName.trim() || "Untitled trip",
-      destination,
-      photos: enriched,
-    };
-
-    setTrips((prev) => [trip, ...prev]);
-    setTripName("");
-    setDestination("album");
-    setPicked([]);
-    setPreparing(false);
-    setScreen("albums");
+      setTrips((prev) => [trip, ...prev]);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setTripName("");
+      setDestination("album");
+      setPicked([]);
+      setScreen("albums");
+    } finally {
+      setPreparing(false);
+    }
   }
 
   async function appendPhotosToTrip(
     tripId: string,
     assets: ImagePicker.ImagePickerAsset[]
   ) {
-    const targetTrip = trips.find((t) => t.id === tripId);
-    if (!targetTrip) return;
+    if (!trips.some((t) => t.id === tripId)) return;
     setPreparing(true);
 
-    const existingIds = new Set(targetTrip.photos.map((p) => p.id));
-    const enriched = (await pickedToPhotos(assets)).filter(
-      (p) => !existingIds.has(p.id)
-    );
+    try {
+      const enriched = await pickedToPhotos(assets);
 
-    const merged = [...targetTrip.photos, ...enriched].sort((a, b) => {
-      if (!a.date) return 1;
-      if (!b.date) return -1;
-      return a.date.getTime() - b.date.getTime();
-    });
+      // Merge against whatever the trip holds *now* (state may have moved on
+      // during the await above); applied identically to trips and activeTrip.
+      const mergeInto = (t: Trip): Trip => {
+        const existingIds = new Set(t.photos.map((p) => p.id));
+        const merged = [
+          ...t.photos,
+          ...enriched.filter((p) => !existingIds.has(p.id)),
+        ].sort(byPhotoDate);
+        return { ...t, photos: merged };
+      };
 
-    const updatedTrip = { ...targetTrip, photos: merged };
-    setTrips((prev) => prev.map((t) => (t.id === tripId ? updatedTrip : t)));
-    setActiveTrip(updatedTrip);
-    setPreparing(false);
+      setTrips((prev) =>
+        prev.map((t) => (t.id === tripId ? mergeInto(t) : t))
+      );
+      setActiveTrip((at) => (at && at.id === tripId ? mergeInto(at) : at));
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } finally {
+      setPreparing(false);
+    }
   }
 
   function saveCaptionTo(photoId: string, text: string) {
@@ -677,7 +1135,7 @@ export default function HomeScreen() {
     setViewerPhotos([]);
   }
 
-  function onViewerScroll(e: any) {
+  function onViewerScroll(e: NativeSyntheticEvent<NativeScrollEvent>) {
     const newIndex = Math.round(e.nativeEvent.contentOffset.x / SCREEN_W);
     if (newIndex !== viewerIndex) {
       Keyboard.dismiss();
@@ -691,10 +1149,12 @@ export default function HomeScreen() {
     return "albums";
   }
 
+  // `emptyReturnTo` is captured by callers before any confirmation dialog so
+  // the return target reflects the screen the flow started on.
   function removePhotosFromAlbum(
     tripId: string,
     photoIds: string[],
-    emptyReturnTo?: Screen
+    emptyReturnTo: Screen
   ) {
     const idSet = new Set(photoIds);
     const currentTrip = trips.find((t) => t.id === tripId);
@@ -708,7 +1168,7 @@ export default function HomeScreen() {
       setActiveStop(null);
       setSelectedTrip((prev) => (prev?.id === tripId ? null : prev));
       exitSelectMode();
-      setScreen(emptyReturnTo ?? emptyReturnScreen());
+      setScreen(emptyReturnTo);
     } else {
       setTrips((prev) =>
         prev.map((t) =>
@@ -741,6 +1201,7 @@ export default function HomeScreen() {
           text: "Remove",
           style: "destructive",
           onPress: () => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
             const newPhotos = viewerPhotos.filter((p) => p.id !== currentPhoto.id);
             if (newPhotos.length === 0) {
               closeViewer();
@@ -761,6 +1222,7 @@ export default function HomeScreen() {
   }
 
   function toggleGridSelect(id: string) {
+    Haptics.selectionAsync();
     setGridSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -774,7 +1236,7 @@ export default function HomeScreen() {
     if (!activeTrip || ids.length === 0) return;
     const emptyReturnTo = emptyReturnScreen();
     Alert.alert(
-      `Remove ${ids.length} photo${ids.length === 1 ? "" : "s"}?`,
+      `Remove ${plural(ids.length, "photo")}?`,
       "They will be removed from this trip but not deleted from your camera roll.",
       [
         { text: "Cancel", style: "cancel" },
@@ -782,6 +1244,7 @@ export default function HomeScreen() {
           text: "Remove",
           style: "destructive",
           onPress: () => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
             removePhotosFromAlbum(activeTrip.id, ids, emptyReturnTo);
             exitSelectMode();
           },
@@ -796,7 +1259,10 @@ export default function HomeScreen() {
       {
         text: "Delete",
         style: "destructive",
-        onPress: () => setTrips((prev) => prev.filter((t) => t.id !== id)),
+        onPress: () => {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+          setTrips((prev) => prev.filter((t) => t.id !== id));
+        },
       },
     ]);
   }
@@ -822,6 +1288,7 @@ export default function HomeScreen() {
   }
 
   function albumCardMenu(trip: Trip) {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     Alert.alert(trip.name, undefined, [
       { text: "Rename", onPress: () => startEdit(trip) },
       { text: "Delete", style: "destructive", onPress: () => deleteTrip(trip.id) },
@@ -835,7 +1302,10 @@ export default function HomeScreen() {
       {
         text: "Delete",
         style: "destructive",
-        onPress: () => setStoryboards((prev) => prev.filter((s) => s.id !== id)),
+        onPress: () => {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+          setStoryboards((prev) => prev.filter((s) => s.id !== id));
+        },
       },
     ]);
   }
@@ -880,6 +1350,7 @@ export default function HomeScreen() {
   }
 
   function toggleSbSelect(id: string) {
+    Haptics.selectionAsync();
     setSbSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     );
@@ -940,6 +1411,7 @@ export default function HomeScreen() {
       createdAt: Date.now(),
     };
     setStoryboards((prev) => [sb, ...prev]);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     setSbSourceTrip(null);
     setSbSelectedIds([]);
     setSbDraftPages([]);
@@ -948,6 +1420,7 @@ export default function HomeScreen() {
   }
 
   function storyCardMenu(sb: Storyboard) {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     Alert.alert(sb.title, undefined, [
       { text: "Rename", onPress: () => startEditStory(sb) },
       { text: "Delete", style: "destructive", onPress: () => deleteStoryboard(sb.id) },
@@ -956,6 +1429,7 @@ export default function HomeScreen() {
   }
 
   function goTab(tab: Tab) {
+    if (tab !== screen) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     exitSelectMode();
     setScreen(tab);
   }
@@ -981,7 +1455,7 @@ export default function HomeScreen() {
   // ---------- FULL-SCREEN SWIPEABLE VIEWER ----------
   if (viewerIndex !== null && viewerPhotos.length > 0) {
     return (
-      <View style={styles.viewer}>
+      <Animated.View style={styles.viewer} entering={SCREEN_FADE()}>
         <View style={styles.viewerHeader}>
           <Text style={styles.viewerAlbumName} numberOfLines={1}>
             {activeTrip?.name ?? ""}
@@ -1022,27 +1496,26 @@ export default function HomeScreen() {
             />
           )}
         />
-      </View>
+      </Animated.View>
     );
   }
 
   // ---------- WORLD MAP ----------
   if (screen === "globalmap") {
-    const pinned = mapTrips
-      .map((t) => ({ trip: t, centre: tripCentre(t) }))
-      .filter((x) => x.centre !== null) as {
-      trip: Trip;
-      centre: { lat: number; lon: number };
-    }[];
+    const pinned = mapTrips.flatMap((trip) => {
+      const centre = tripCentre(trip);
+      return centre ? [{ trip, centre }] : [];
+    });
 
     const selectedStops = selectedTrip ? clusterIntoStops(selectedTrip.photos) : [];
+    const stopCoords = selectedStops.map((s) => ({ lat: s.lat, lon: s.lon }));
     const worldRegion =
       pinned.length > 0
         ? boundsForCoords(pinned.map((p) => p.centre), 0.3, 20)
         : null;
 
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <TopAppBar />
         {/* Header row: breadcrumbs (or back-to-all-trips) + artifact badge */}
         <View style={styles.mapCrumbRow}>
@@ -1081,12 +1554,10 @@ export default function HomeScreen() {
           {/* Framed map */}
           <View style={styles.mapFrame}>
             {pinned.length === 0 ? (
-              <View style={styles.mapEmpty}>
-                <MaterialIcons name="public" size={36} color={Atlas.color.outline} />
-                <Text style={styles.emptyText}>
-                  No map trips yet.{"\n"}Create a trip and choose Map or Both.
-                </Text>
-              </View>
+              <EmptyState
+                icon="public"
+                message={"No map trips yet.\nCreate a trip and choose Map or Both."}
+              />
             ) : (
               <>
                 <MapView
@@ -1095,9 +1566,7 @@ export default function HomeScreen() {
                   mapType={Platform.OS === "ios" ? "mutedStandard" : "standard"}
                   initialRegion={
                     selectedTrip && selectedStops.length > 0
-                      ? boundsForCoords(
-                          selectedStops.map((s) => ({ lat: s.lat, lon: s.lon }))
-                        )
+                      ? boundsForCoords(stopCoords)
                       : worldRegion!
                   }
                 >
@@ -1155,12 +1624,7 @@ export default function HomeScreen() {
                           key={"stop-" + s.id}
                           coordinate={{ latitude: s.lat, longitude: s.lon }}
                           title={"Stop " + (i + 1)}
-                          description={
-                            s.photos.length +
-                            " photo" +
-                            (s.photos.length === 1 ? "" : "s") +
-                            " Â· tap to view"
-                          }
+                          description={plural(s.photos.length, "photo") + " · tap to view"}
                           onPress={() => {
                             setStopgridReturn("globalmap");
                             setActiveStop(s);
@@ -1188,9 +1652,7 @@ export default function HomeScreen() {
                     onPress={() => {
                       if (selectedTrip && selectedStops.length > 0) {
                         mapRef.current?.animateToRegion(
-                          boundsForCoords(
-                            selectedStops.map((s) => ({ lat: s.lat, lon: s.lon }))
-                          ),
+                          boundsForCoords(stopCoords),
                           600
                         );
                       } else if (worldRegion) {
@@ -1206,7 +1668,7 @@ export default function HomeScreen() {
             )}
           </View>
         <BottomNav active="globalmap" onNavigate={goTab} />
-      </View>
+      </Animated.View>
     );
   }
 
@@ -1217,14 +1679,10 @@ export default function HomeScreen() {
       : 1;
     const stopIsEmpty = activeStop.photos.length === 0;
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <SubHeader
           title={"Stop " + (stopIndex > 0 ? stopIndex : "?")}
-          subtitle={
-            activeStop.photos.length +
-            " photo" +
-            (activeStop.photos.length === 1 ? "" : "s")
-          }
+          subtitle={plural(activeStop.photos.length, "photo")}
           onBack={() => {
             exitSelectMode();
             setScreen(stopgridReturn);
@@ -1232,83 +1690,41 @@ export default function HomeScreen() {
           backLabel="Map"
           rightAction={
             !stopIsEmpty && activeTrip ? (
-              selectMode ? (
-                <TouchableOpacity onPress={exitSelectMode}>
-                  <Text style={styles.headerAction}>Cancel</Text>
-                </TouchableOpacity>
-              ) : (
-                <TouchableOpacity onPress={() => setSelectMode(true)}>
-                  <Text style={styles.headerAction}>Select</Text>
-                </TouchableOpacity>
-              )
+              <SelectToggle
+                selectMode={selectMode}
+                onEnter={() => setSelectMode(true)}
+                onExit={exitSelectMode}
+              />
             ) : undefined
           }
         />
         {stopIsEmpty ? (
-          <View style={styles.center}>
-            <Text style={styles.emptyText}>No photos in this stop.</Text>
-          </View>
+          <EmptyState message="No photos in this stop." />
         ) : (
-          <FlatList
+          <PhotoGrid
             key="stopgrid-grid"
-            data={activeStop.photos}
-            keyExtractor={(p) => p.id}
-            numColumns={GRID_COLS}
-            columnWrapperStyle={styles.gridRow}
-            contentContainerStyle={{
-              padding: GRID_PADDING,
-              paddingBottom: selectMode ? 110 : 24,
+            photos={activeStop.photos}
+            bottomPadding={selectMode ? 110 : 24}
+            onPressCell={(photo, index) => {
+              if (selectMode) {
+                toggleGridSelect(photo.id);
+              } else {
+                openViewer(activeStop!.photos, index, !!activeTrip);
+              }
             }}
-            renderItem={({ item, index }) => {
-              const isSelected = gridSelectedIds.has(item.id);
-              return (
-                <TouchableOpacity
-                  style={styles.pickCell}
-                  onPress={() => {
-                    if (selectMode) {
-                      toggleGridSelect(item.id);
-                    } else {
-                      openViewer(activeStop!.photos, index, !!activeTrip);
-                    }
-                  }}
-                  activeOpacity={0.85}
-                >
-                  <Image source={{ uri: item.uri }} style={styles.gridThumb} />
-                  {selectMode &&
-                    (isSelected ? (
-                      <View style={styles.selectCheck}>
-                        <MaterialIcons name="check" size={15} color={Atlas.color.onPrimary} />
-                      </View>
-                    ) : (
-                      <View style={styles.selectCircle} />
-                    ))}
-                </TouchableOpacity>
-              );
-            }}
+            overlay={(photo) =>
+              selectMode && <SelectOverlay selected={gridSelectedIds.has(photo.id)} />
+            }
           />
         )}
         {selectMode && (
-          <View style={styles.selectBar}>
-            <TouchableOpacity onPress={exitSelectMode} style={styles.selectBarCancel}>
-              <Text style={styles.selectBarCancelText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.selectBarDelete,
-                gridSelectedIds.size === 0 && styles.selectBarDeleteDisabled,
-              ]}
-              onPress={confirmDeleteSelected}
-              disabled={gridSelectedIds.size === 0}
-            >
-              <Text style={styles.selectBarDeleteText}>
-                {gridSelectedIds.size > 0
-                  ? `Delete (${gridSelectedIds.size})`
-                  : "Delete"}
-              </Text>
-            </TouchableOpacity>
-          </View>
+          <SelectBar
+            count={gridSelectedIds.size}
+            onCancel={exitSelectMode}
+            onDelete={confirmDeleteSelected}
+          />
         )}
-      </View>
+      </Animated.View>
     );
   }
 
@@ -1316,14 +1732,10 @@ export default function HomeScreen() {
   if (screen === "album" && activeTrip) {
     const isEmpty = activeTrip.photos.length === 0;
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <SubHeader
           title={activeTrip.name}
-          subtitle={
-            activeTrip.photos.length +
-            " memor" +
-            (activeTrip.photos.length === 1 ? "y" : "ies")
-          }
+          subtitle={plural(activeTrip.photos.length, "memory", "memories")}
           onBack={() => {
             exitSelectMode();
             setScreen("albums");
@@ -1331,61 +1743,37 @@ export default function HomeScreen() {
           backLabel="Albums"
           rightAction={
             !isEmpty ? (
-              selectMode ? (
-                <TouchableOpacity onPress={exitSelectMode}>
-                  <Text style={styles.headerAction}>Cancel</Text>
-                </TouchableOpacity>
-              ) : (
-                <TouchableOpacity onPress={() => setSelectMode(true)}>
-                  <Text style={styles.headerAction}>Select</Text>
-                </TouchableOpacity>
-              )
+              <SelectToggle
+                selectMode={selectMode}
+                onEnter={() => setSelectMode(true)}
+                onExit={exitSelectMode}
+              />
             ) : undefined
           }
         />
         {isEmpty ? (
-          <View style={styles.center}>
-            <Text style={styles.emptyText}>No photos in this album.</Text>
-          </View>
+          <EmptyState message="No photos in this album." />
         ) : (
-          <FlatList
+          <PhotoGrid
             key="album-grid"
-            data={activeTrip.photos}
-            keyExtractor={(p) => p.id}
-            numColumns={GRID_COLS}
-            columnWrapperStyle={styles.gridRow}
-            contentContainerStyle={{ padding: GRID_PADDING, paddingBottom: 110 }}
-            renderItem={({ item, index }) => {
-              const isSelected = gridSelectedIds.has(item.id);
-              return (
-                <TouchableOpacity
-                  style={styles.pickCell}
-                  onPress={() => {
-                    if (selectMode) {
-                      toggleGridSelect(item.id);
-                    } else {
-                      openViewer(activeTrip!.photos, index, true);
-                    }
-                  }}
-                  activeOpacity={0.85}
-                >
-                  <Image source={{ uri: item.uri }} style={styles.gridThumb} />
-                  {selectMode &&
-                    (isSelected ? (
-                      <View style={styles.selectCheck}>
-                        <MaterialIcons name="check" size={15} color={Atlas.color.onPrimary} />
-                      </View>
-                    ) : (
-                      <View style={styles.selectCircle} />
-                    ))}
-                </TouchableOpacity>
-              );
+            photos={activeTrip.photos}
+            onPressCell={(photo, index) => {
+              if (selectMode) {
+                toggleGridSelect(photo.id);
+              } else {
+                openViewer(activeTrip!.photos, index, true);
+              }
             }}
+            overlay={(photo) =>
+              selectMode && <SelectOverlay selected={gridSelectedIds.has(photo.id)} />
+            }
           />
         )}
         {!selectMode && (
-          <TouchableOpacity
+          <PressableScale
             style={styles.primaryPill}
+            scaleTo={0.95}
+            haptic="light"
             onPress={() => openPicker(activeTrip!.id)}
             disabled={preparing}
           >
@@ -1401,37 +1789,23 @@ export default function HomeScreen() {
                 <Text style={styles.primaryPillText}>Add Photos</Text>
               </>
             )}
-          </TouchableOpacity>
+          </PressableScale>
         )}
         {selectMode && (
-          <View style={styles.selectBar}>
-            <TouchableOpacity onPress={exitSelectMode} style={styles.selectBarCancel}>
-              <Text style={styles.selectBarCancelText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.selectBarDelete,
-                gridSelectedIds.size === 0 && styles.selectBarDeleteDisabled,
-              ]}
-              onPress={confirmDeleteSelected}
-              disabled={gridSelectedIds.size === 0}
-            >
-              <Text style={styles.selectBarDeleteText}>
-                {gridSelectedIds.size > 0
-                  ? `Delete (${gridSelectedIds.size})`
-                  : "Delete"}
-              </Text>
-            </TouchableOpacity>
-          </View>
+          <SelectBar
+            count={gridSelectedIds.size}
+            onCancel={exitSelectMode}
+            onDelete={confirmDeleteSelected}
+          />
         )}
-      </View>
+      </Animated.View>
     );
   }
 
   // ---------- NAME + DESTINATION ----------
   if (screen === "details") {
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <SubHeader
           title="New Journal"
           onBack={() => {
@@ -1454,14 +1828,14 @@ export default function HomeScreen() {
             Add this to...
           </Text>
           <View style={styles.choiceRow}>
-            {(["album", "map", "both"] as Destination[]).map((d, i) => {
+            {DESTINATION_CHIPS.map(({ destination: d, label, rotate }) => {
               const isActive = destination === d;
               return (
                 <TouchableOpacity
                   key={d}
                   style={[
                     styles.tapedChip,
-                    { transform: [{ rotate: ["-1deg", "2deg", "-1deg"][i] }] },
+                    { transform: [{ rotate }] },
                     isActive && styles.tapedChipActive,
                   ]}
                   onPress={() => setDestination(d)}
@@ -1469,7 +1843,7 @@ export default function HomeScreen() {
                   <Text
                     style={[styles.tapedChipText, isActive && styles.tapedChipTextActive]}
                   >
-                    {d === "album" ? "#Album" : d === "map" ? "#Map" : "#Both"}
+                    {label}
                   </Text>
                 </TouchableOpacity>
               );
@@ -1477,11 +1851,13 @@ export default function HomeScreen() {
           </View>
 
           <Text style={styles.detailsNote}>
-            {picked.length} photo{picked.length === 1 ? "" : "s"} selected
+            {plural(picked.length, "photo")} selected
           </Text>
 
-          <TouchableOpacity
+          <PressableScale
             style={[styles.primaryBtn, { marginTop: Atlas.space.stackMd }]}
+            scaleTo={0.96}
+            haptic="light"
             onPress={saveTrip}
             disabled={preparing}
           >
@@ -1490,9 +1866,9 @@ export default function HomeScreen() {
             ) : (
               <Text style={styles.primaryBtnText}>Save Trip</Text>
             )}
-          </TouchableOpacity>
+          </PressableScale>
         </ScrollView>
-      </View>
+      </Animated.View>
     );
   }
 
@@ -1500,7 +1876,7 @@ export default function HomeScreen() {
   if (screen === "sbPickAlbum") {
     const candidates = trips.filter((t) => t.photos.length > 0);
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <SubHeader
           title="New Storyboard"
           subtitle="choose a source album"
@@ -1508,12 +1884,10 @@ export default function HomeScreen() {
           backLabel="Stories"
         />
         {candidates.length === 0 ? (
-          <View style={styles.center}>
-            <MaterialIcons name="photo-library" size={36} color={Atlas.color.outline} />
-            <Text style={styles.emptyText}>
-              No albums with photos yet.{"\n"}Create a trip first, then tell its story.
-            </Text>
-          </View>
+          <EmptyState
+            icon="photo-library"
+            message={"No albums with photos yet.\nCreate a trip first, then tell its story."}
+          />
         ) : (
           <FlatList
             key="sb-album-list"
@@ -1533,13 +1907,16 @@ export default function HomeScreen() {
                 <Image
                   source={{ uri: item.photos[0].uri }}
                   style={styles.sbAlbumThumb}
+                  recyclingKey={item.id}
+                  cachePolicy="memory-disk"
+                  transition={PHOTO_FADE_MS}
                 />
                 <View style={{ flex: 1 }}>
                   <Text style={styles.sbAlbumName} numberOfLines={1}>
                     {item.name}
                   </Text>
                   <Text style={styles.sbAlbumCount}>
-                    {item.photos.length} photo{item.photos.length === 1 ? "" : "s"}
+                    {plural(item.photos.length, "photo")}
                   </Text>
                 </View>
                 <MaterialIcons
@@ -1551,54 +1928,48 @@ export default function HomeScreen() {
             )}
           />
         )}
-      </View>
+      </Animated.View>
     );
   }
 
   // ---------- STORYBOARD: PICK PHOTOS (in story order) ----------
   if (screen === "sbPickPhotos" && sbSourceTrip) {
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <SubHeader
           title={sbSourceTrip.name}
           subtitle="tap photos in story order"
           onBack={() => setScreen("sbPickAlbum")}
           backLabel="Albums"
         />
-        <FlatList
+        <PhotoGrid
           key="sb-pick-grid"
-          data={sbSourceTrip.photos}
-          keyExtractor={(p) => p.id}
-          numColumns={GRID_COLS}
-          columnWrapperStyle={styles.gridRow}
-          contentContainerStyle={{ padding: GRID_PADDING, paddingBottom: 110 }}
-          renderItem={({ item }) => {
-            const idx = sbSelectedIds.indexOf(item.id);
-            const isSel = idx !== -1;
+          photos={sbSourceTrip.photos}
+          onPressCell={(photo) => toggleSbSelect(photo.id)}
+          overlay={(photo) => {
+            const idx = sbSelectedIds.indexOf(photo.id);
             return (
-              <TouchableOpacity
-                style={styles.pickCell}
-                onPress={() => toggleSbSelect(item.id)}
-                activeOpacity={0.8}
-              >
-                <Image source={{ uri: item.uri }} style={styles.gridThumb} />
-                {isSel && (
-                  <View style={styles.badge}>
-                    <Text style={styles.badgeText}>{idx + 1}</Text>
-                  </View>
-                )}
-              </TouchableOpacity>
+              idx !== -1 && (
+                <View style={styles.badge}>
+                  <Text style={styles.badgeText}>{idx + 1}</Text>
+                </View>
+              )
             );
           }}
         />
         {sbSelectedIds.length > 0 && (
-          <TouchableOpacity style={styles.primaryPill} onPress={beginArrange}>
+          <PressableScale
+            style={styles.primaryPill}
+            scaleTo={0.95}
+            haptic="light"
+            onPress={beginArrange}
+          >
             <Text style={styles.primaryPillText}>
               Next  ({sbSelectedIds.length})
             </Text>
-          </TouchableOpacity>
+          </PressableScale>
         )}
-      </View>
+      </Animated.View>
     );
   }
 
@@ -1606,12 +1977,10 @@ export default function HomeScreen() {
   if (screen === "sbArrange" && sbSourceTrip) {
     const byId = new Map(sbSourceTrip.photos.map((p) => [p.id, p]));
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <SubHeader
           title="Arrange the Story"
-          subtitle={
-            sbDraftPages.length + " page" + (sbDraftPages.length === 1 ? "" : "s")
-          }
+          subtitle={plural(sbDraftPages.length, "page")}
           onBack={() => setScreen("sbPickPhotos")}
           backLabel="Photos"
         />
@@ -1646,7 +2015,13 @@ export default function HomeScreen() {
               return (
                 <View style={styles.sbPageRow}>
                   <Text style={styles.sbPageNum}>{index + 1}</Text>
-                  <Image source={{ uri: photo.uri }} style={styles.sbPageThumb} />
+                  <Image
+                    source={{ uri: photo.uri }}
+                    style={styles.sbPageThumb}
+                    recyclingKey={photo.id}
+                    cachePolicy="memory-disk"
+                    transition={PHOTO_FADE_MS}
+                  />
                   <TextInput
                     style={styles.sbCaptionInput}
                     placeholder="Tell this moment..."
@@ -1696,21 +2071,23 @@ export default function HomeScreen() {
               );
             }}
             ListFooterComponent={
-              <TouchableOpacity
+              <PressableScale
                 style={[
                   styles.primaryBtn,
                   { marginTop: Atlas.space.stackLg },
                   sbDraftPages.length === 0 && { opacity: 0.4 },
                 ]}
+                scaleTo={0.96}
+                haptic="light"
                 onPress={saveStoryboard}
                 disabled={sbDraftPages.length === 0}
               >
                 <Text style={styles.primaryBtnText}>Save Storyboard</Text>
-              </TouchableOpacity>
+              </PressableScale>
             }
           />
         </KeyboardAvoidingView>
-      </View>
+      </Animated.View>
     );
   }
 
@@ -1730,21 +2107,24 @@ export default function HomeScreen() {
             onBack={closeStory}
             backLabel="Stories"
           />
-          <View style={styles.center}>
-            <MaterialIcons name="auto-stories" size={36} color={Atlas.color.outline} />
-            <Text style={styles.emptyText}>
-              The photos for this storyboard are no longer in its source album.
-            </Text>
-          </View>
+          <EmptyState
+            icon="auto-stories"
+            message="The photos for this storyboard are no longer in its source album."
+          />
         </View>
       );
     }
 
     const idx = Math.min(storyPageIdx, pages.length - 1);
     const page = pages[idx];
-    const goNext = () =>
+    const goNext = () => {
+      if (idx < pages.length - 1) Haptics.selectionAsync();
       setStoryPageIdx((i) => Math.min(i + 1, pages.length - 1));
-    const goPrev = () => setStoryPageIdx((i) => Math.max(i - 1, 0));
+    };
+    const goPrev = () => {
+      if (idx > 0) Haptics.selectionAsync();
+      setStoryPageIdx((i) => Math.max(i - 1, 0));
+    };
 
     const flingNext = Gesture.Fling()
       .direction(Directions.LEFT)
@@ -1754,7 +2134,7 @@ export default function HomeScreen() {
       .onStart(() => runOnJS(goPrev)());
 
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         {/* Progress segments + title + close */}
         <View style={styles.sbvTop}>
           <View style={styles.sbvProgressRow}>
@@ -1788,11 +2168,7 @@ export default function HomeScreen() {
             >
               <View style={[styles.storyPhotoFrame, styles.sbvFrame]}>
                 <View style={styles.photoTape} />
-                <Image
-                  source={{ uri: page.photo.uri }}
-                  style={styles.storyPhoto}
-                  resizeMode="cover"
-                />
+                <StoryPhoto uri={page.photo.uri} />
                 {page.photo.date && (
                   <Text style={styles.sbvDateLine}>
                     {fmtStamp(page.photo.date)}
@@ -1828,7 +2204,7 @@ export default function HomeScreen() {
             {idx + 1} / {pages.length}
           </Text>
         </View>
-      </View>
+      </Animated.View>
     );
   }
 
@@ -1840,7 +2216,7 @@ export default function HomeScreen() {
     ];
 
     return (
-      <View style={styles.screen}>
+      <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
         <TopAppBar />
         <FlatList
           key="storybook-grid"
@@ -1857,8 +2233,7 @@ export default function HomeScreen() {
               </Text>
               {storyboards.length > 0 ? (
                 <Text style={styles.albumsStats}>
-                  {storyboards.length} storyboard
-                  {storyboards.length === 1 ? "" : "s"}
+                  {plural(storyboards.length, "storyboard")}
                 </Text>
               ) : (
                 <Text style={styles.albumsStats}>
@@ -1870,16 +2245,11 @@ export default function HomeScreen() {
           renderItem={({ item, index }) => {
             if (item.id === "__new__") {
               return (
-                <TouchableOpacity
-                  style={styles.newJournalCard}
+                <NewItemCard
+                  label="Create Storyboard"
+                  entering={cardEntering(index)}
                   onPress={startCreateStoryboard}
-                  activeOpacity={0.8}
-                >
-                  <View style={styles.newJournalPlus}>
-                    <MaterialIcons name="add" size={22} color={Atlas.color.primary} />
-                  </View>
-                  <Text style={styles.newJournalText}>Create Storyboard</Text>
-                </TouchableOpacity>
+                />
               );
             }
             const sb = item as Storyboard;
@@ -1887,12 +2257,11 @@ export default function HomeScreen() {
             const cover = pages[0]?.photo;
             const isEditing = editingStoryId === sb.id;
             return (
-              <TouchableOpacity
-                style={[
-                  styles.polaroidCard,
-                  { transform: [{ rotate: CARD_ROTATIONS[index % CARD_ROTATIONS.length] }] },
-                ]}
-                activeOpacity={0.85}
+              <PressableScale
+                style={styles.polaroidCard}
+                entering={cardEntering(index)}
+                rotate={CARD_ROTATIONS[index % CARD_ROTATIONS.length]}
+                scaleTo={0.96}
                 onPress={() => {
                   if (isEditing) return;
                   openStoryViewer(sb);
@@ -1901,7 +2270,13 @@ export default function HomeScreen() {
               >
                 <View style={styles.polaroidPhotoWrap}>
                   {cover ? (
-                    <Image source={{ uri: cover.uri }} style={styles.polaroidPhoto} />
+                    <Image
+                      source={{ uri: cover.uri }}
+                      style={styles.polaroidPhoto}
+                      recyclingKey={cover.id}
+                      cachePolicy="memory-disk"
+                      transition={PHOTO_FADE_MS}
+                    />
                   ) : (
                     <View style={[styles.polaroidPhoto, styles.polaroidPhotoEmpty]}>
                       <MaterialIcons
@@ -1914,14 +2289,10 @@ export default function HomeScreen() {
                 </View>
                 <View style={styles.polaroidMeta}>
                   {isEditing ? (
-                    <TextInput
-                      style={styles.polaroidTitleInput}
+                    <TitleEditInput
                       value={editingStoryName}
                       onChangeText={setEditingStoryName}
-                      autoFocus
-                      returnKeyType="done"
-                      onSubmitEditing={confirmEditStory}
-                      onBlur={confirmEditStory}
+                      onCommit={confirmEditStory}
                     />
                   ) : (
                     <Text style={styles.polaroidTitle} numberOfLines={2}>
@@ -1929,15 +2300,16 @@ export default function HomeScreen() {
                     </Text>
                   )}
                   <Text style={styles.polaroidSub}>
-                    {pages.length} page{pages.length === 1 ? "" : "s"}
+                    {plural(pages.length, "page")}
                   </Text>
                 </View>
-              </TouchableOpacity>
+              </PressableScale>
             );
           }}
         />
+        <GrainOverlay />
         <BottomNav active="storybook" onNavigate={goTab} />
-      </View>
+      </Animated.View>
     );
   }
 
@@ -1948,7 +2320,7 @@ export default function HomeScreen() {
   ];
 
   return (
-    <View style={styles.screen}>
+    <Animated.View style={styles.screen} entering={SCREEN_FADE()}>
       <TopAppBar />
       <FlatList
         key="albums-grid"
@@ -1964,38 +2336,37 @@ export default function HomeScreen() {
               Albums & Archives
             </Text>
             {albumTrips.length > 0 && (
-              <Text style={styles.albumsStats}>
-                {albumTrips.length} trip{albumTrips.length === 1 ? "" : "s"}
-                {" Â· "}
-                {albumTrips.reduce((n, t) => n + t.photos.length, 0)} memories
-              </Text>
+              <View style={styles.odoLine}>
+                <Odometer value={albumTrips.length} />
+                <Text style={styles.odoLabel}>
+                  trip{albumTrips.length === 1 ? "" : "s"}
+                </Text>
+                <Odometer
+                  value={albumTrips.reduce((n, t) => n + t.photos.length, 0)}
+                />
+                <Text style={styles.odoLabel}>memories</Text>
+              </View>
             )}
           </View>
         }
         renderItem={({ item, index }) => {
           if (item.id === "__new__") {
             return (
-              <TouchableOpacity
-                style={styles.newJournalCard}
+              <NewItemCard
+                label="New Journal"
+                entering={cardEntering(index)}
                 onPress={() => openPicker()}
-                activeOpacity={0.8}
-              >
-                <View style={styles.newJournalPlus}>
-                  <MaterialIcons name="add" size={22} color={Atlas.color.primary} />
-                </View>
-                <Text style={styles.newJournalText}>New Journal</Text>
-              </TouchableOpacity>
+              />
             );
           }
           const trip = item as Trip;
           const isEditing = editingTripId === trip.id;
           return (
-            <TouchableOpacity
-              style={[
-                styles.polaroidCard,
-                { transform: [{ rotate: CARD_ROTATIONS[index % CARD_ROTATIONS.length] }] },
-              ]}
-              activeOpacity={0.85}
+            <PressableScale
+              style={styles.polaroidCard}
+              entering={cardEntering(index)}
+              rotate={CARD_ROTATIONS[index % CARD_ROTATIONS.length]}
+              scaleTo={0.96}
               onPress={() => {
                 if (isEditing) return;
                 setActiveTrip(trip);
@@ -2008,6 +2379,9 @@ export default function HomeScreen() {
                   <Image
                     source={{ uri: trip.photos[0].uri }}
                     style={styles.polaroidPhoto}
+                    recyclingKey={trip.photos[0].id}
+                    cachePolicy="memory-disk"
+                    transition={PHOTO_FADE_MS}
                   />
                 ) : (
                   <View style={[styles.polaroidPhoto, styles.polaroidPhotoEmpty]}>
@@ -2019,16 +2393,13 @@ export default function HomeScreen() {
                   </View>
                 )}
               </View>
+              <Postmark date={trip.photos.find((p) => p.date)?.date ?? null} />
               <View style={styles.polaroidMeta}>
                 {isEditing ? (
-                  <TextInput
-                    style={styles.polaroidTitleInput}
+                  <TitleEditInput
                     value={editingName}
                     onChangeText={setEditingName}
-                    autoFocus
-                    returnKeyType="done"
-                    onSubmitEditing={confirmEdit}
-                    onBlur={confirmEdit}
+                    onCommit={confirmEdit}
                   />
                 ) : (
                   <Text style={styles.polaroidTitle} numberOfLines={2}>
@@ -2036,20 +2407,16 @@ export default function HomeScreen() {
                   </Text>
                 )}
                 <Text style={styles.polaroidSub}>
-                  {trip.photos.length} Memor{trip.photos.length === 1 ? "y" : "ies"}
+                  {plural(trip.photos.length, "Memory", "Memories")}
                 </Text>
               </View>
-              {trip.destination === "both" && (
-                <View style={styles.artifactStamp}>
-                  <Text style={styles.artifactStampText}>On Map</Text>
-                </View>
-              )}
-            </TouchableOpacity>
+            </PressableScale>
           );
         }}
       />
+      <GrainOverlay />
       <BottomNav active="albums" onNavigate={goTab} />
-    </View>
+    </Animated.View>
   );
 }
 
@@ -2083,8 +2450,21 @@ const styles = StyleSheet.create({
     paddingBottom: S.stackSm,
     paddingHorizontal: S.marginMobile,
     backgroundColor: C.background,
-    borderBottomWidth: 1,
-    borderBottomColor: C.borderThin,
+  },
+  appBarDivider: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  // Dashed hairline: RN needs equal border widths for dashed to render on
+  // Android, so a 2px-bordered line is clipped to its top half.
+  routeDividerClip: { height: 1, overflow: "hidden" },
+  routeDividerLine: {
+    height: 2,
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: "rgba(0,0,0,0.18)",
   },
   appBarLeft: { flexDirection: "row", alignItems: "center", gap: 16 },
   appBarTitle: {
@@ -2166,7 +2546,9 @@ const styles = StyleSheet.create({
   },
   // Each item gets an equal flex slot so the bar is centered identically
   // on every screen regardless of label widths/weights.
+  navStrip: { flex: 1, flexDirection: "row", alignItems: "center" },
   navItem: { flex: 1, alignItems: "center", justifyContent: "center" },
+  navItemInner: { alignItems: "center" },
   navLabel: {
     ...T.labelMd,
     color: C.onSurfaceVariant,
@@ -2195,6 +2577,34 @@ const styles = StyleSheet.create({
     letterSpacing: 0.6,
     color: C.onSurfaceVariant,
     marginTop: 6,
+  },
+  odoLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 8,
+    gap: 6,
+  },
+  odoRow: { flexDirection: "row", gap: 2 },
+  odoCell: {
+    backgroundColor: "#33302C",
+    borderRadius: 2,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    minWidth: 14,
+    alignItems: "center",
+  },
+  odoDigit: {
+    fontFamily: F.monoBold,
+    fontSize: 12,
+    lineHeight: 16,
+    color: "#F3DFB6",
+  },
+  odoLabel: {
+    fontFamily: F.monoItalic,
+    fontSize: 11,
+    letterSpacing: 0.6,
+    color: C.onSurfaceVariant,
+    marginRight: 8,
   },
   albumColumns: { paddingHorizontal: S.marginMobile, gap: 16 },
   polaroidCard: {
@@ -2242,25 +2652,6 @@ const styles = StyleSheet.create({
     letterSpacing: 0.6,
     color: "rgba(68,71,72,0.7)",
     marginTop: 4,
-  },
-  artifactStamp: {
-    position: "absolute",
-    top: 8,
-    right: 8,
-    backgroundColor: "rgba(232,226,214,0.65)",
-    borderWidth: 1.5,
-    borderColor: C.borderThin,
-    borderRadius: R.sm,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    transform: [{ rotate: "12deg" }],
-  },
-  artifactStampText: {
-    fontFamily: F.mono,
-    fontSize: 9,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-    color: C.onSecondaryContainer,
   },
   newJournalCard: {
     flex: 1,
@@ -2334,11 +2725,11 @@ const styles = StyleSheet.create({
     marginBottom: 102,
     borderRadius: R.lg,
     overflow: "hidden",
-    borderWidth: 1,
-    borderColor: C.borderThin,
+    borderWidth: 1.5,
+    borderStyle: "dashed",
+    borderColor: C.borderDashed,
     backgroundColor: "rgba(232,226,214,0.4)",
   },
-  mapEmpty: { flex: 1, alignItems: "center", justifyContent: "center", padding: S.gutter },
   mapPin: { alignItems: "center" },
   mapPinLabel: {
     fontFamily: F.mono,

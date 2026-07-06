@@ -1,50 +1,22 @@
-# Welcome to your Expo app 👋
+# Waypost
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A travel-journal app built with [Expo](https://expo.dev) (SDK 54, expo-router). Import photos into trips, see them clustered into stops on a world map, and curate them into flip-through storyboards.
 
-## Get started
-
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## Development
 
 ```bash
-npm run reset-project
+npm install
+npx expo start
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+The app uses native modules (`react-native-maps`, `expo-media-library`), so run it in a [development build](https://docs.expo.dev/develop/development-builds/introduction/) rather than Expo Go:
 
-## Learn more
+```bash
+npx expo run:ios     # or run:android
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+## Layout
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+- `app/(tabs)/index.tsx` — the whole UI: albums, trip creation, world map, stop grids, storyboard builder and player (a single screen driven by an internal state machine; the router tab bar is hidden).
+- `components/` — intro animation, grain overlay, postmark stamp, pressable-scale wrapper.
+- `constants/theme.ts` — "Atlas of Life" design tokens (source of truth is the Stitch design MD).

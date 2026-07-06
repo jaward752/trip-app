@@ -4,8 +4,6 @@
  * values here by eye; the Stitch design MD is the source of truth.
  */
 
-import { Platform } from 'react-native';
-
 // ---------- COLORS (Stitch namedColors) ----------
 export const Atlas = {
   color: {
@@ -120,47 +118,3 @@ export const Atlas = {
     monoBold: 'CourierPrime_700Bold',
   },
 } as const;
-
-// ---------- Template compatibility exports ----------
-
-const tintColorLight = Atlas.color.primary;
-
-export const Colors = {
-  light: {
-    text: Atlas.color.onSurface,
-    background: Atlas.color.background,
-    tint: tintColorLight,
-    icon: Atlas.color.onSurfaceVariant,
-    tabIconDefault: Atlas.color.onSurfaceVariant,
-    tabIconSelected: tintColorLight,
-  },
-  dark: {
-    text: Atlas.color.onSurface,
-    background: Atlas.color.background,
-    tint: tintColorLight,
-    icon: Atlas.color.onSurfaceVariant,
-    tabIconDefault: Atlas.color.onSurfaceVariant,
-    tabIconSelected: tintColorLight,
-  },
-};
-
-export const Fonts = Platform.select({
-  ios: {
-    sans: 'HankenGrotesk_400Regular',
-    serif: 'ui-serif',
-    rounded: 'ui-rounded',
-    mono: 'CourierPrime_400Regular',
-  },
-  default: {
-    sans: 'HankenGrotesk_400Regular',
-    serif: 'serif',
-    rounded: 'HankenGrotesk_400Regular',
-    mono: 'CourierPrime_400Regular',
-  },
-  web: {
-    sans: "'Hanken Grotesk', system-ui, sans-serif",
-    serif: "Georgia, 'Times New Roman', serif",
-    rounded: "'Hanken Grotesk', system-ui, sans-serif",
-    mono: "'Courier Prime', monospace",
-  },
-});
